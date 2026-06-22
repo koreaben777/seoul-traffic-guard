@@ -38,12 +38,12 @@ OPTIONAL_ENV_VARS = ("KAKAO_CLIENT_SECRET", "ALLOWED_ORIGINS", "TASK_RUN_SECRET"
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "set_alert_area",
-        "description": "Register a Seoul Traffic Guard alert area from a label, address, and radius.",
+        "description": "Register a Seoul Traffic Guard alert area from a label, Seoul address or place keyword, and radius.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "label": {"type": "string", "description": "User-facing area label, for example home, work, or school."},
-                "address": {"type": "string", "description": "Seoul address to geocode later."},
+                "address": {"type": "string", "description": "Seoul address or place keyword, for example 서울시청 or 을지로입구역."},
                 "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 1000},
             },
             "required": ["label", "address"],
@@ -516,29 +516,36 @@ def send_kakao_self_message(message: str, user_id: str = DEFAULT_USER_ID) -> Non
         post_kakao_api("/v2/api/talk/memo/default/send", data, refresh_kakao_token(user_id))
 
 
-def geocode_address(address: str) -> dict[str, Any]:
-    data = kakao_json("/v2/local/search/address.json", {"query": address})
-    docs = data.get("documents") or []
-    if not docs:
-        raise ValueError(f"No Kakao Local result for address: {address}")
-
-    doc = docs[0]
-    x = float(doc["x"])
-    y = float(doc["y"])
+def wgs84_to_tm(x: float, y: float, query: str) -> dict[str, float]:
     tm_data = kakao_json(
         "/v2/local/geo/transcoord.json",
         {"x": str(x), "y": str(y), "input_coord": "WGS84", "output_coord": "TM"},
     )
     tm_docs = tm_data.get("documents") or []
     if not tm_docs:
-        raise ValueError(f"No Kakao coordinate transform result for address: {address}")
+        raise ValueError(f"No Kakao coordinate transform result for address: {query}")
+    return {"tm_x": float(tm_docs[0]["x"]), "tm_y": float(tm_docs[0]["y"])}
+
+
+def geocode_address(address: str) -> dict[str, Any]:
+    data = kakao_json("/v2/local/search/keyword.json", {"query": address})
+    docs = data.get("documents") or []
+    if not docs:
+        data = kakao_json("/v2/local/search/address.json", {"query": address})
+        docs = data.get("documents") or []
+    if not docs:
+        raise ValueError(f"No Kakao Local result for address: {address}")
+
+    doc = docs[0]
+    x = float(doc["x"])
+    y = float(doc["y"])
+    tm = wgs84_to_tm(x, y, address)
 
     return {
-        "address_name": doc.get("address_name") or address,
+        "address_name": doc.get("road_address_name") or doc.get("address_name") or doc.get("place_name") or address,
         "x": x,
         "y": y,
-        "tm_x": float(tm_docs[0]["x"]),
-        "tm_y": float(tm_docs[0]["y"]),
+        **tm,
     }
 
 
@@ -718,7 +725,7 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         except urllib.error.URLError:
             return text_result("주소 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
         except ValueError:
-            return text_result("주소를 찾을 수 없습니다. 주소를 더 구체적으로 입력해 주세요.")
+            return text_result("장소나 주소를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
         areas[label] = {"label": label, "address": address, "radius_m": radius_m, **geo}
         save_alert_area(areas[label], user_id)
         return text_result(f"Registered alert area '{label}' at {geo['address_name']} with radius {radius_m}m.")

@@ -21,6 +21,7 @@ from server import (
     TOOLS,
     build_kakao_authorize_url,
     complete_oauth,
+    geocode_address,
     handle_rpc,
     load_state,
     normalize_user_id,
@@ -335,6 +336,28 @@ def test_set_alert_area_stores_geocoded_coordinates():
     assert areas()["work"]["address_name"] == "서울 중구 세종대로 110"
     assert areas()["work"]["tm_x"] == 198000.0
     assert areas()["work"]["tm_y"] == 451000.0
+
+
+def test_geocode_address_accepts_place_keyword():
+    responses = {
+        "/v2/local/search/keyword.json": {
+            "documents": [
+                {
+                    "place_name": "을지로입구역",
+                    "road_address_name": "서울 중구 을지로 42",
+                    "x": "126.982",
+                    "y": "37.566",
+                }
+            ]
+        },
+        "/v2/local/geo/transcoord.json": {"documents": [{"x": "198100.0", "y": "451100.0"}]},
+    }
+
+    with patch("server.kakao_json", side_effect=lambda path, query: responses[path]):
+        result = geocode_address("을지로입구역")
+
+    assert result["address_name"] == "서울 중구 을지로 42"
+    assert result["tm_x"] == 198100.0
 
 
 def test_check_traffic_issues_filters_accinfo_near_area():
