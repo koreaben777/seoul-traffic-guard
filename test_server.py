@@ -1,4 +1,5 @@
 from datetime import datetime
+import io
 import http.client
 import json
 import os
@@ -13,25 +14,34 @@ TEST_TMP = tempfile.TemporaryDirectory()
 os.environ["PLAYMCP_DB_PATH"] = os.path.join(TEST_TMP.name, "test.db")
 
 from server import (
+    ACCINFO_CACHE,
     ALERT_AREAS,
     Handler,
     OAUTH_STATE,
     OAUTH_TOKENS,
+    RATE_LIMITS,
     SCHEDULED_ALERTS,
+    SENT_MESSAGE_GUARD,
     TOOLS,
     TRANSIT_ROUTE_OPTIONS,
     admin_dong_for_text,
     build_kakao_authorize_url,
     complete_oauth,
+    db_connect,
+    distance_m,
     geocode_address,
+    fetch_accinfo_cached,
     handle_rpc,
     load_state,
     normalize_user_id,
+    odsay_lane_name,
+    odsay_json,
     readiness_report,
     refresh_kakao_token,
     run_due_alerts,
     save_oauth_tokens,
     server_address,
+    UserIdentityRequired,
     user_id_from_headers,
 )
 
@@ -57,14 +67,10 @@ def test_tool_contract():
     assert names == [
         "set_alert_area",
         "list_alert_areas",
-        "set_route_alert_area",
-        "set_transit_route_alert_area",
+        "delete_alert_area",
         "find_transit_route_options",
         "set_selected_transit_route_alert_area",
-        "set_district_alert_area",
-        "set_alert_areas",
         "check_traffic_issues",
-        "preview_alert_message",
         "send_self_alert",
         "set_scheduled_alert",
         "list_scheduled_alerts",
@@ -115,6 +121,34 @@ def test_user_id_from_headers():
     assert normalize_user_id("bad/user").startswith("u_")
     with patch("server.env_value", side_effect=lambda name: "x-custom-user" if name == "PLAYMCP_USER_ID_HEADERS" else ""):
         assert user_id_from_headers({"x-custom-user": "user-b"}) == "user-b"
+
+
+def test_user_id_header_can_be_required():
+    with patch("server.env_value", side_effect=lambda name: "true" if name == "REQUIRE_USER_ID_HEADER" else ""):
+        try:
+            user_id_from_headers({})
+        except UserIdentityRequired:
+            pass
+        else:
+            raise AssertionError("expected missing user id header to be rejected")
+
+
+def test_configured_user_id_header_disables_default_spoof_headers():
+    def fake_env(name):
+        if name == "PLAYMCP_USER_ID_HEADERS":
+            return "x-confirmed-playmcp-user"
+        if name == "REQUIRE_USER_ID_HEADER":
+            return "true"
+        return ""
+
+    with patch("server.env_value", side_effect=fake_env):
+        assert user_id_from_headers({"x-confirmed-playmcp-user": "user-a"}) == "user-a"
+        try:
+            user_id_from_headers({"x-playmcp-user-id": "spoofed"})
+        except UserIdentityRequired:
+            pass
+        else:
+            raise AssertionError("expected default spoof header to be ignored")
 
 
 def test_http_transport_edges():
@@ -211,6 +245,38 @@ def test_http_transport_edges():
         assert status == 200
         assert headers["content-type"].startswith("application/json")
         assert json.loads(body)["result"]["protocolVersion"] == "2025-03-26"
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        huge_body = b'{"x":"' + b"a" * 300000 + b'"}'
+        conn.request("POST", "/mcp", body=huge_body, headers={"Accept": "application/json"})
+        res = conn.getresponse()
+        oversized_body = res.read()
+        conn.close()
+        assert res.status == 413
+        assert b"request too large" in oversized_body
+
+        batch = [
+            {"jsonrpc": "2.0", "id": i, "method": "ping", "params": {}}
+            for i in range(21)
+        ]
+        status, headers, body = request(
+            "POST",
+            "/mcp",
+            batch,
+            {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        )
+        assert status == 400
+        assert json.loads(body)["error"]["message"] == "MCP batch request is too large."
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", "/mcp", body=b"{bad json", headers={"Accept": "application/json"})
+        res = conn.getresponse()
+        bad_body = res.read()
+        conn.close()
+        assert res.status == 400
+        bad_message = json.loads(bad_body)["error"]["message"]
+        assert "잘못된 MCP 요청" in bad_message
+        assert "Expecting" not in bad_message
     finally:
         server.shutdown()
         server.server_close()
@@ -257,7 +323,7 @@ def test_rpc_flow():
     assert initialized["serverInfo"]["name"] == "seoul-traffic-guard"
 
     listed = rpc("tools/list")["result"]["tools"]
-    assert len(listed) == 14
+    assert len(listed) == 10
 
     with patch(
         "server.geocode_address",
@@ -280,6 +346,40 @@ def test_rpc_flow():
 
     areas = rpc("tools/call", {"name": "list_alert_areas", "arguments": {}})["result"]["content"][0]["text"]
     assert "서울 중구 세종대로 110" in areas
+
+
+def test_other_tool_calls_share_user_rate_limit():
+    RATE_LIMITS.clear()
+    ACCINFO_CACHE.clear()
+    ALERT_AREAS.clear()
+    areas("heavy-user")["work"] = {
+        "label": "work",
+        "address": "x",
+        "radius_m": 100,
+        "tm_x": 198000.0,
+        "tm_y": 451000.0,
+    }
+
+    with patch("server.fetch_accinfo", return_value=[]):
+        results = [
+            rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "work"}}, request_id=i, user_id="heavy-user")
+            for i in range(61)
+        ]
+
+    assert "등록 지역 주변" in results[0]["result"]["content"][0]["text"]
+    assert "요청이 많습니다" in results[-1]["result"]["content"][0]["text"]
+
+
+def test_delete_alert_area_removes_registered_area():
+    ALERT_AREAS.clear()
+    areas()["home"] = {"label": "home", "address": "서울시청", "radius_m": 1000, "tm_x": 198000, "tm_y": 451000}
+
+    deleted = rpc("tools/call", {"name": "delete_alert_area", "arguments": {"label": "home"}})["result"]["content"][0]["text"]
+    listed = rpc("tools/call", {"name": "list_alert_areas", "arguments": {}})["result"]["content"][0]["text"]
+
+    assert "home" in deleted
+    assert "home" not in areas()
+    assert listed == "No alert areas registered."
 
 
 def test_rpc_user_data_isolated():
@@ -368,63 +468,28 @@ def test_geocode_address_accepts_place_keyword():
     assert result["tm_x"] == 198100.0
 
 
-def test_set_route_alert_area_matches_issue_near_route_point():
-    ALERT_AREAS.clear()
-    geocodes = {
-        "집": {"address_name": "집", "x": 126.9, "y": 37.5, "tm_x": 198000.0, "tm_y": 451000.0},
-        "학교": {"address_name": "학교", "x": 127.0, "y": 37.6, "tm_x": 199000.0, "tm_y": 452000.0},
+def test_geocode_address_rejects_bare_road_name():
+    responses = {
+        "/v2/local/search/keyword.json": {
+            "documents": [
+                {
+                    "place_name": "을지로",
+                    "road_address_name": "서울 중구 을지로 30",
+                    "x": "126.982",
+                    "y": "37.566",
+                }
+            ]
+        },
+        "/v2/local/geo/transcoord.json": {"documents": [{"x": "198100.0", "y": "451100.0"}]},
     }
 
-    with patch("server.geocode_address", side_effect=lambda value: geocodes[value]), patch(
-        "server.route_points",
-        return_value=[{"tm_x": 198000.0, "tm_y": 451000.0}, {"tm_x": 199000.0, "tm_y": 452000.0}],
-    ):
-        rpc(
-            "tools/call",
-            {
-                "name": "set_route_alert_area",
-                "arguments": {"label": "등교길", "origin": "집", "destination": "학교", "radius_m": 700},
-            },
-        )
-
-    assert areas()["등교길"]["area_type"] == "route_corridor"
-    with patch(
-        "server.fetch_accinfo",
-        return_value=[{"grs80tm_x": 199100.0, "grs80tm_y": 452100.0, "acc_info": "공사"}],
-    ):
-        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "등교길"}})["result"]["content"][0]["text"]
-    assert "공사" in text
-
-
-def test_set_district_alert_area_registers_area():
-    ALERT_AREAS.clear()
-    with patch(
-        "server.admin_dong_for_text",
-        return_value={
-            "address_name": "서울특별시 강남구 역삼1동",
-            "region_code": "1168064000",
-            "region_1depth_name": "서울특별시",
-            "region_2depth_name": "강남구",
-            "region_3depth_name": "역삼1동",
-            "x": 127.033,
-            "y": 37.5,
-            "tm_x": 202000.0,
-            "tm_y": 445000.0,
-        },
-    ):
-        rpc(
-            "tools/call",
-            {"name": "set_district_alert_area", "arguments": {"label": "회사동네", "district": "역삼1동"}},
-        )
-
-    assert areas()["회사동네"]["area_type"] == "admin_dong"
-    assert areas()["회사동네"]["region_code"] == "1168064000"
-    with patch("server.fetch_accinfo", return_value=[{"grs80tm_x": 202100.0, "grs80tm_y": 445100.0, "acc_info": "통제"}]), patch(
-        "server.admin_dong_for_issue",
-        return_value={"code": "1168064000"},
-    ):
-        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "회사동네"}})["result"]["content"][0]["text"]
-    assert "통제" in text
+    with patch("server.kakao_json", side_effect=lambda path, query: responses[path]):
+        try:
+            geocode_address("을지로")
+        except ValueError as exc:
+            assert "more specific" in str(exc)
+        else:
+            raise AssertionError("expected ambiguous road name to be rejected")
 
 
 def test_admin_dong_for_text_uses_region_code():
@@ -447,113 +512,201 @@ def test_admin_dong_for_text_uses_region_code():
     assert result["region_code"] == "1168064000"
 
 
-def test_set_transit_route_alert_area_matches_station_issue():
-    ALERT_AREAS.clear()
-
-    def fake_geocode(stop):
-        return {
-            "address_name": stop,
-            "x": 126.973,
-            "y": 37.522,
-            "tm_x": 197000.0,
-            "tm_y": 449000.0,
-        }
-
-    with patch("server.geocode_address", side_effect=fake_geocode):
-        rpc(
-            "tools/call",
-            {"name": "set_transit_route_alert_area", "arguments": {"label": "지하철출근길", "stops": ["이촌역"]}},
-        )
-
-    assert areas()["지하철출근길"]["area_type"] == "transit_stops"
-    with patch("server.fetch_accinfo", return_value=[{"grs80tm_x": 197100.0, "grs80tm_y": 449100.0, "acc_info": "이촌역 사고"}]):
-        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "지하철출근길"}})["result"]["content"][0]["text"]
-    assert "이촌역 사고" in text
-
-
-def test_selectable_transit_route_options_register_chosen_route_only():
+def test_odsay_transit_route_options_register_selected_path():
     ALERT_AREAS.clear()
     TRANSIT_ROUTE_OPTIONS.clear()
-    coords = {
-        "출발지": (1000.0, 1000.0),
-        "이촌역": (2000.0, 2000.0),
-        "도착지": (3000.0, 3000.0),
-        "공덕역": (9000.0, 9000.0),
+
+    odsay_route = {
+        "result": {
+            "path": [
+                {
+                    "info": {"totalTime": 31, "payment": 1500, "mapObj": "map-1"},
+                    "subPath": [
+                        {"trafficType": 3, "sectionTime": 5},
+                        {
+                            "trafficType": 1,
+                            "lane": [{"name": "4호선"}],
+                            "startName": "이촌",
+                            "endName": "동대문역사문화공원",
+                            "passStopList": {
+                                "stations": [
+                                    {"stationName": "이촌", "x": "126.973", "y": "37.522"},
+                                    {"stationName": "동대문역사문화공원", "x": "126.990", "y": "37.565"},
+                                ]
+                            },
+                        },
+                        {
+                            "trafficType": 1,
+                            "lane": [{"name": "2호선"}],
+                            "startName": "동대문역사문화공원",
+                            "endName": "을지로입구",
+                            "passStopList": {
+                                "stations": [
+                                    {"stationName": "동대문역사문화공원", "x": "126.990", "y": "37.565"},
+                                    {"stationName": "을지로입구", "x": "126.982", "y": "37.566"},
+                                ]
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+    odsay_lane = {
+        "result": {
+            "lane": [
+                {"section": [{"graphPos": [{"x": 126.973, "y": 37.522}, {"x": 126.980, "y": 37.540}, {"x": 126.990, "y": 37.565}]}]},
+                {"section": [{"graphPos": [{"x": 126.990, "y": 37.565}, {"x": 126.985, "y": 37.566}, {"x": 126.982, "y": 37.566}]}]},
+            ]
+        }
     }
 
-    def fake_geocode(stop):
-        tm_x, tm_y = coords[stop]
-        return {"address_name": stop, "x": 126.0, "y": 37.0, "tm_x": tm_x, "tm_y": tm_y}
+    def fake_geocode(address):
+        return {"address_name": address, "x": 126.0, "y": 37.0, "tm_x": 1000.0, "tm_y": 1000.0}
 
-    with patch("server.geocode_address", side_effect=fake_geocode):
+    def fake_odsay(path, query):
+        if path == "/searchPubTransPathT":
+            return odsay_route
+        if path == "/loadLane":
+            return odsay_lane
+        raise AssertionError(path)
+
+    def fake_tm(x, y, query):
+        return {"tm_x": x * 1000, "tm_y": y * 1000}
+
+    with patch("server.env_value", side_effect=lambda name: "odsay-secret" if name == "ODSAY_API_KEY" else os.environ.get(name, "")):
+        with (
+            patch("server.geocode_address", side_effect=fake_geocode),
+            patch("server.odsay_json", side_effect=fake_odsay),
+            patch("server.wgs84_to_tm", side_effect=fake_tm),
+        ):
+            text = rpc(
+                "tools/call",
+                {
+                    "name": "find_transit_route_options",
+                    "arguments": {"label": "출근길", "origin": "이촌로 174", "destination": "을지로 19"},
+                },
+            )["result"]["content"][0]["text"]
+            result = rpc(
+                "tools/call",
+                {"name": "set_selected_transit_route_alert_area", "arguments": {"label": "출근길", "route_ids": ["1"], "radius_m": 300}},
+            )["result"]["content"][0]["text"]
+
+    assert "후보 대중교통 경로입니다." in text
+    assert "1. 4호선 이촌-동대문역사문화공원, 2호선 동대문역사문화공원-을지로입구" in text
+
+    assert "1번 경로를 출근길로 등록했습니다." in result
+    assert "4호선 이촌역부터 동대문역사문화공원역까지" in result
+    assert "2호선 동대문역사문화공원역부터 을지로입구역까지" in result
+    area = areas()["출근길"]
+    assert area["area_type"] == "transit_route_polyline"
+    assert area["address_name"] == "4호선 이촌역부터 동대문역사문화공원역까지, 2호선 동대문역사문화공원역부터 을지로입구역까지"
+    assert len(area["points"]) == 5
+    assert {"tm_x": 126980.0, "tm_y": 37540.0} in area["points"]
+
+
+def test_odsay_lane_name_lists_equivalent_bus_lanes():
+    lanes = [{"busNo": "504"}, {"busNo": "500"}]
+    assert odsay_lane_name(lanes) == "504/500"
+
+
+def test_transit_route_polyline_matches_issue_near_segment():
+    area = {
+        "area_type": "transit_route_polyline",
+        "radius_m": 100,
+        "points": [{"tm_x": 0.0, "tm_y": 0.0}, {"tm_x": 1000.0, "tm_y": 0.0}],
+    }
+    assert distance_m(area, {"grs80tm_x": 500.0, "grs80tm_y": 50.0}) == 50.0
+
+
+def test_find_transit_route_options_reports_missing_odsay_key():
+    with patch("server.env_value", side_effect=lambda name: "" if name == "ODSAY_API_KEY" else os.environ.get(name, "")):
         text = rpc(
             "tools/call",
-            {
-                "name": "find_transit_route_options",
-                "arguments": {
-                    "label": "선택출근길",
-                    "origin": "출발지",
-                    "destination": "도착지",
-                    "route_options": [
-                        {"name": "이촌 경유", "stops": ["출발지", "이촌역", "도착지"]},
-                        {"name": "공덕 경유", "stops": ["출발지", "공덕역", "도착지"]},
-                    ],
-                },
-            },
+            {"name": "find_transit_route_options", "arguments": {"label": "출근길", "origin": "이촌로 174", "destination": "을지로 19"}},
         )["result"]["content"][0]["text"]
 
-    assert "[ ] route-1 - 이촌 경유" in text
-    assert "[ ] route-2 - 공덕 경유" in text
-
-    result = rpc(
-        "tools/call",
-        {"name": "set_selected_transit_route_alert_area", "arguments": {"label": "선택출근길", "route_ids": ["route-1"], "radius_m": 200}},
-    )["result"]["content"][0]["text"]
-    assert "route-1(이촌 경유)" in result
-    area = areas()["선택출근길"]
-    assert area["area_type"] == "transit_selected_routes"
-    assert [point["stop"] for point in area["points"]] == ["출발지", "이촌역", "도착지"]
-
-    issues = [
-        {"grs80tm_x": 2050.0, "grs80tm_y": 2050.0, "acc_info": "이촌역 사고"},
-        {"grs80tm_x": 9000.0, "grs80tm_y": 9000.0, "acc_info": "공덕역 통제"},
-    ]
-    with patch("server.fetch_accinfo", return_value=issues):
-        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "선택출근길"}})["result"]["content"][0]["text"]
-    assert "이촌역 사고" in text
-    assert "공덕역 통제" not in text
+    assert "ODSAY_API_KEY" in text
 
 
-def test_set_alert_areas_registers_multiple_places():
-    ALERT_AREAS.clear()
-
+def test_find_transit_route_options_reports_odsay_auth_failure():
     def fake_geocode(address):
-        return {
-            "address_name": address,
-            "x": 126.978,
-            "y": 37.566,
-            "tm_x": 198000.0,
-            "tm_y": 451000.0,
-        }
+        return {"address_name": address, "x": 126.0, "y": 37.0, "tm_x": 1000.0, "tm_y": 1000.0}
 
-    with patch("server.geocode_address", side_effect=fake_geocode):
-        rpc(
+    with (
+        patch("server.env_value", side_effect=lambda name: "odsay-secret" if name == "ODSAY_API_KEY" else os.environ.get(name, "")),
+        patch("server.geocode_address", side_effect=fake_geocode),
+        patch("server.odsay_json", return_value={"error": [{"code": "500", "message": "[ApiKeyAuthFailed] ApiKey authentication failed."}]}),
+    ):
+        text = rpc(
             "tools/call",
-            {
-                "name": "set_alert_areas",
-                "arguments": {
-                    "areas": [
-                        {"label": "집", "address": "서울역", "radius_m": 1000},
-                        {"label": "회사", "address": "서울시청", "radius_m": 500},
-                    ]
-                },
-            },
-        )
+            {"name": "find_transit_route_options", "arguments": {"label": "출근길", "origin": "이촌로 174", "destination": "을지로 19"}},
+        )["result"]["content"][0]["text"]
 
-    assert set(areas()) == {"집", "회사"}
+    assert "ODsay API 인증" in text
+    assert "Server API Key" in text
+
+
+def test_odsay_json_reads_auth_failure_from_http_error_body():
+    body = b'{"error":[{"code":"500","message":"[ApiKeyAuthFailed] ApiKey authentication failed."}]}'
+    error = urllib.error.HTTPError("https://api.odsay.com", 500, "Internal Server Error", {}, io.BytesIO(body))
+
+    with (
+        patch("server.env_value", return_value="odsay-secret"),
+        patch("urllib.request.urlopen", side_effect=error),
+    ):
+        try:
+            odsay_json("/searchPubTransPathT", {})
+        except ValueError as exc:
+            assert "ODSAY_AUTH_FAILED" in str(exc)
+        else:
+            raise AssertionError("expected ODSAY_AUTH_FAILED")
+
+
+def test_odsay_json_retries_transient_url_error():
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"result":{"ok":true}}'
+
+    with (
+        patch("server.env_value", return_value="odsay-secret"),
+        patch(
+            "urllib.request.urlopen",
+            side_effect=[
+                urllib.error.URLError("slow"),
+                urllib.error.URLError("slow"),
+                urllib.error.URLError("slow"),
+                urllib.error.URLError("slow"),
+                Response(),
+            ],
+        ) as urlopen,
+        patch("server.time_module.sleep") as sleep,
+    ):
+        assert odsay_json("/searchPubTransPathT", {})["result"]["ok"] is True
+
+    assert urlopen.call_count == 5
+    assert [args.args for args in sleep.call_args_list] == [(2,), (2,), (2,), (2,)]
+
+
+def test_find_transit_route_options_reports_odsay_temporary_failure():
+    with patch("server.build_transit_route_options", side_effect=urllib.error.URLError("slow")):
+        text = rpc(
+            "tools/call",
+            {"name": "find_transit_route_options", "arguments": {"label": "출근길", "origin": "이촌로 174", "destination": "을지로 19"}},
+        )["result"]["content"][0]["text"]
+
+    assert "ODsay" in text
+    assert "5번 재시도" in text
 
 
 def test_check_traffic_issues_filters_accinfo_near_area():
+    ACCINFO_CACHE.clear()
     ALERT_AREAS.clear()
     areas()["work"] = {
         "label": "work",
@@ -580,6 +733,7 @@ def test_check_traffic_issues_filters_accinfo_near_area():
 
 
 def test_check_traffic_issues_returns_short_external_error():
+    ACCINFO_CACHE.clear()
     ALERT_AREAS.clear()
     areas()["work"] = {
         "label": "work",
@@ -594,8 +748,54 @@ def test_check_traffic_issues_returns_short_external_error():
             "content"
         ][0]["text"]
 
-    assert "교통 정보 조회" in result
+    assert "3번 재시도" in result
     assert "raw network detail" not in result
+
+
+def test_check_traffic_issues_retries_timeout_then_succeeds():
+    ACCINFO_CACHE.clear()
+    ALERT_AREAS.clear()
+    areas()["work"] = {
+        "label": "work",
+        "address": "x",
+        "radius_m": 100,
+        "tm_x": 198000.0,
+        "tm_y": 451000.0,
+    }
+    calls = [
+        TimeoutError("slow"),
+        urllib.error.URLError("slow"),
+        [{"acc_info": "시청 인근 공사", "grs80tm_x": 198030.0, "grs80tm_y": 451040.0}],
+    ]
+
+    with patch("server.fetch_accinfo", side_effect=calls):
+        result = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "work"}})["result"][
+            "content"
+        ][0]["text"]
+
+    assert "재시도 후 조회" in result
+    assert "시청 인근 공사" in result
+
+
+def test_check_traffic_issues_fails_after_three_timeout_retries():
+    ACCINFO_CACHE.clear()
+    ALERT_AREAS.clear()
+    areas()["work"] = {
+        "label": "work",
+        "address": "x",
+        "radius_m": 100,
+        "tm_x": 198000.0,
+        "tm_y": 451000.0,
+    }
+
+    with patch("server.fetch_accinfo", side_effect=TimeoutError("slow")) as fetch:
+        result = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "work"}})["result"][
+            "content"
+        ][0]["text"]
+
+    assert fetch.call_count == 3
+    assert "3번 재시도" in result
+    assert "slow" not in result
 
 
 def test_fetch_accinfo_normalizes_uppercase_xml_tags():
@@ -623,6 +823,18 @@ def test_fetch_accinfo_normalizes_uppercase_xml_tags():
         rows = fetch_accinfo(1)
 
     assert rows == [{"acc_info": "공사", "grs80tm_x": 198030.0, "grs80tm_y": 451040.0}]
+
+
+def test_fetch_accinfo_cached_reuses_recent_result():
+    ACCINFO_CACHE.clear()
+
+    with patch("server.fetch_accinfo", return_value=[{"acc_info": "cached"}]) as fetch:
+        first = fetch_accinfo_cached()
+        second = fetch_accinfo_cached()
+
+    assert first == [{"acc_info": "cached"}]
+    assert second == [{"acc_info": "cached"}]
+    assert fetch.call_count == 1
 
 
 def test_schedule_tools_register_list_delete():
@@ -846,6 +1058,8 @@ def test_complete_oauth_stores_tokens_per_user():
 
 
 def test_send_self_alert_posts_kakao_message_when_connected():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
     OAUTH_TOKENS.clear()
     tokens()["access_token"] = "access-1"
     calls = []
@@ -866,7 +1080,54 @@ def test_send_self_alert_posts_kakao_message_when_connected():
     assert "테스트 알림" in calls[0][1]["template_object"]
 
 
+def test_send_self_alert_blocks_duplicate_message_for_one_minute():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
+    OAUTH_TOKENS.clear()
+    tokens("dup-user")["access_token"] = "access-1"
+
+    with patch("server.post_kakao_api", return_value={"result_code": 0}) as post:
+        first = rpc(
+            "tools/call",
+            {"name": "send_self_alert", "arguments": {"message": "중복 테스트", "dry_run": False}},
+            user_id="dup-user",
+        )["result"]["content"][0]["text"]
+        second = rpc(
+            "tools/call",
+            {"name": "send_self_alert", "arguments": {"message": "중복 테스트", "dry_run": False}},
+            user_id="dup-user",
+        )["result"]["content"][0]["text"]
+
+    assert "Sent alert" in first
+    assert "이미 같은 알림" in second
+    assert post.call_count == 1
+
+
+def test_send_self_alert_rate_limits_after_six_messages():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
+    OAUTH_TOKENS.clear()
+    tokens("sender")["access_token"] = "access-1"
+
+    with patch("server.post_kakao_api", return_value={"result_code": 0}) as post:
+        results = [
+            rpc(
+                "tools/call",
+                {"name": "send_self_alert", "arguments": {"message": f"테스트 알림 {i}", "dry_run": False}},
+                request_id=i,
+                user_id="sender",
+            )["result"]["content"][0]["text"]
+            for i in range(7)
+        ]
+
+    assert "Sent alert" in results[0]
+    assert "요청이 많습니다" in results[-1]
+    assert post.call_count == 6
+
+
 def test_send_self_alert_returns_short_external_error():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
     OAUTH_TOKENS.clear()
     tokens()["access_token"] = "access-1"
 
@@ -880,7 +1141,19 @@ def test_send_self_alert_returns_short_external_error():
     assert "raw token detail" not in result
 
 
+def test_tool_error_does_not_echo_internal_exception():
+    with patch("server.call_tool", side_effect=ValueError("apiKey=raw-secret-detail")):
+        response = rpc("tools/call", {"name": "send_self_alert", "arguments": {}})
+
+    message = response["error"]["message"]
+    assert "입력값" in message
+    assert "raw-secret-detail" not in message
+    assert "apiKey" not in message
+
+
 def test_send_self_alert_requires_oauth_when_not_connected():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
     OAUTH_TOKENS.clear()
 
     result = rpc(
@@ -955,6 +1228,8 @@ def test_refresh_kakao_token_updates_saved_tokens():
 
 
 def test_send_self_alert_refreshes_when_access_token_missing():
+    RATE_LIMITS.clear()
+    SENT_MESSAGE_GUARD.clear()
     OAUTH_TOKENS.clear()
     tokens()["refresh_token"] = "refresh-1"
     calls = []
@@ -976,27 +1251,70 @@ def test_send_self_alert_refreshes_when_access_token_missing():
     assert calls[0][1] == "access-2"
 
 
+def test_legacy_plaintext_oauth_tokens_still_load_without_key():
+    OAUTH_TOKENS.clear()
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO oauth_tokens(user_id, data) VALUES (?, ?)",
+            ("legacy-user", json.dumps({"access_token": "legacy-access"}, ensure_ascii=False)),
+        )
+
+    load_state()
+    assert tokens("legacy-user")["access_token"] == "legacy-access"
+
+
+def test_oauth_tokens_are_encrypted_when_key_is_configured():
+    from cryptography.fernet import Fernet
+
+    OAUTH_TOKENS.clear()
+    key = Fernet.generate_key().decode()
+
+    with patch("server.env_value", side_effect=lambda name: key if name == "TOKEN_ENCRYPTION_KEY" else os.environ.get(name, "")):
+        save_oauth_tokens({"access_token": "access-secret", "refresh_token": "refresh-secret"}, "encrypted-user")
+        with db_connect() as conn:
+            stored = conn.execute("SELECT data FROM oauth_tokens WHERE user_id = ?", ("encrypted-user",)).fetchone()[0]
+
+        assert stored.startswith("fernet:")
+        assert "access-secret" not in stored
+        assert "refresh-secret" not in stored
+
+        OAUTH_TOKENS.clear()
+        load_state()
+        assert tokens("encrypted-user")["access_token"] == "access-secret"
+        assert tokens("encrypted-user")["refresh_token"] == "refresh-secret"
+
+
 if __name__ == "__main__":
     test_tool_contract()
     test_server_address_uses_deploy_env()
     test_readiness_report_masks_config_values()
     test_readiness_report_degraded_when_required_env_missing()
     test_user_id_from_headers()
+    test_user_id_header_can_be_required()
+    test_configured_user_id_header_disables_default_spoof_headers()
     test_http_transport_edges()
     test_task_run_due_alerts_endpoint_requires_secret()
     test_rpc_flow()
+    test_other_tool_calls_share_user_rate_limit()
+    test_delete_alert_area_removes_registered_area()
     test_rpc_user_data_isolated()
     test_set_alert_area_stores_geocoded_coordinates()
     test_geocode_address_accepts_place_keyword()
-    test_set_route_alert_area_matches_issue_near_route_point()
-    test_set_district_alert_area_registers_area()
     test_admin_dong_for_text_uses_region_code()
-    test_set_transit_route_alert_area_matches_station_issue()
-    test_selectable_transit_route_options_register_chosen_route_only()
-    test_set_alert_areas_registers_multiple_places()
+    test_odsay_transit_route_options_register_selected_path()
+    test_odsay_lane_name_lists_equivalent_bus_lanes()
+    test_transit_route_polyline_matches_issue_near_segment()
+    test_find_transit_route_options_reports_missing_odsay_key()
+    test_find_transit_route_options_reports_odsay_auth_failure()
+    test_odsay_json_reads_auth_failure_from_http_error_body()
+    test_odsay_json_retries_transient_url_error()
+    test_find_transit_route_options_reports_odsay_temporary_failure()
     test_check_traffic_issues_filters_accinfo_near_area()
     test_check_traffic_issues_returns_short_external_error()
+    test_check_traffic_issues_retries_timeout_then_succeeds()
+    test_check_traffic_issues_fails_after_three_timeout_retries()
     test_fetch_accinfo_normalizes_uppercase_xml_tags()
+    test_fetch_accinfo_cached_reuses_recent_result()
     test_schedule_tools_register_list_delete()
     test_run_due_alerts_sends_once_per_day_when_issues_match()
     test_run_due_alerts_continues_after_one_schedule_fails()
@@ -1006,9 +1324,14 @@ if __name__ == "__main__":
     test_complete_oauth_stores_tokens()
     test_complete_oauth_stores_tokens_per_user()
     test_send_self_alert_posts_kakao_message_when_connected()
+    test_send_self_alert_blocks_duplicate_message_for_one_minute()
+    test_send_self_alert_rate_limits_after_six_messages()
     test_send_self_alert_returns_short_external_error()
+    test_tool_error_does_not_echo_internal_exception()
     test_send_self_alert_requires_oauth_when_not_connected()
     test_sqlite_persists_alert_area_schedule_and_tokens()
     test_refresh_kakao_token_updates_saved_tokens()
     test_send_self_alert_refreshes_when_access_token_missing()
+    test_legacy_plaintext_oauth_tokens_still_load_without_key()
+    test_oauth_tokens_are_encrypted_when_key_is_configured()
     print("ok")

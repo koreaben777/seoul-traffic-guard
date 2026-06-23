@@ -31,6 +31,14 @@ docker rm -f stg-runtime-smoke
   - `ALLOWED_ORIGINS`
   - `TASK_RUN_SECRET`
   - `PLAYMCP_USER_ID_HEADERS`
+  - `REQUIRE_USER_ID_HEADER`
+  - `MAX_REQUEST_BYTES`
+  - `MAX_BATCH_REQUESTS`
+  - `TOKEN_ENCRYPTION_KEY`
+- [ ] Confirm the real PlayMCP user identity header name.
+- [ ] Set `PLAYMCP_USER_ID_HEADERS` to only the confirmed header.
+- [ ] Set `REQUIRE_USER_ID_HEADER=true` after PlayMCP header behavior is confirmed.
+- [ ] Set `TOKEN_ENCRYPTION_KEY` if OAuth tokens will be persisted.
 
 ## After Deployed Host Is Issued
 
@@ -49,6 +57,11 @@ docker rm -f stg-runtime-smoke
 ## Review Request
 
 - [ ] Tool names do not contain `kakao`.
-- [ ] Tool count is 8.
+- [ ] Tool count is 10 and stays within the PlayMCP recommended 3-10 range.
 - [ ] Raw API payloads, API keys, OAuth tokens, and full error traces are not exposed.
+- [ ] Oversized MCP request bodies return 413.
+- [ ] JSON-RPC batches above `MAX_BATCH_REQUESTS` are rejected.
+- [ ] Per-user rate limiting returns a retry-later message.
+- [ ] Duplicate KakaoTalk sends within 60 seconds are blocked.
+- [ ] SQLite token rows do not contain raw `access_token` or `refresh_token` values when `TOKEN_ENCRYPTION_KEY` is set.
 - [ ] Known limitations are documented in `README.md`.

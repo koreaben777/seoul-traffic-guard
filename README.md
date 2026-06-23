@@ -7,10 +7,11 @@ Korean service name: `서울 교통 이슈 알리미`
 ## What it does
 
 - Registers named alert areas from Seoul addresses.
+- Registers named point-radius alert areas and selectable public-transit routes.
 - Geocodes addresses with Kakao Local API.
+- Finds public-transit route candidates with ODsay.
 - Checks Seoul Open Data `AccInfo` traffic incidents.
 - Matches incidents against registered area radius.
-- Previews alert text before sending.
 - Sends alerts to the user's own KakaoTalk chat after OAuth consent.
 - Stores scheduled alerts and runs them while the server is alive.
 
@@ -41,10 +42,12 @@ Example user prompts:
 
 | Tool | Purpose |
 | --- | --- |
-| `set_alert_area` | Register or update an alert area by label, address, and radius. |
+| `set_alert_area` | Register or update a point-radius alert area from a Seoul address or place keyword. |
 | `list_alert_areas` | List the current user's alert areas. |
+| `delete_alert_area` | Delete an alert area by label. |
+| `find_transit_route_options` | Find selectable public-transit route candidates with ODsay. |
+| `set_selected_transit_route_alert_area` | Register the route candidate selected by the user. |
 | `check_traffic_issues` | Check Seoul traffic issues near the current user's registered areas. |
-| `preview_alert_message` | Build alert text before sending. |
 | `send_self_alert` | Send a prepared alert to the current user's own KakaoTalk chat. |
 | `set_scheduled_alert` | Create or update a scheduled traffic alert. |
 | `list_scheduled_alerts` | List scheduled traffic alerts. |
@@ -59,8 +62,13 @@ KAKAO_REST_API_KEY=
 KAKAO_CLIENT_SECRET=
 KAKAO_REDIRECT_URI=http://localhost:8000/auth/kakao/callback
 SEOUL_OPENAPI_KEY=
+ODSAY_API_KEY=
 PLAYMCP_DB_PATH=./playmcp.db
 PLAYMCP_USER_ID_HEADERS=
+REQUIRE_USER_ID_HEADER=
+MAX_REQUEST_BYTES=262144
+MAX_BATCH_REQUESTS=20
+TOKEN_ENCRYPTION_KEY=
 ALLOWED_ORIGINS=
 TASK_RUN_SECRET=
 ```
@@ -68,7 +76,11 @@ TASK_RUN_SECRET=
 Notes:
 
 - `KAKAO_CLIENT_SECRET` is required only when the Kakao app client secret is enabled.
-- `PLAYMCP_USER_ID_HEADERS` is optional and comma-separated. Set it only if PlayMCP confirms a different user id header.
+- `ODSAY_API_KEY` is required for public-transit route candidate lookup.
+- `PLAYMCP_USER_ID_HEADERS` is optional and comma-separated. In public deployment, set it to the confirmed PlayMCP user id header only.
+- `REQUIRE_USER_ID_HEADER=true` rejects MCP requests without the confirmed user id header. Keep it empty only for local single-user development.
+- `MAX_REQUEST_BYTES` and `MAX_BATCH_REQUESTS` cap MCP request size and batch fan-out.
+- `TOKEN_ENCRYPTION_KEY` enables Fernet encryption for newly saved OAuth tokens. Generate it with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
 - `ALLOWED_ORIGINS` is optional locally and comma-separated. Set it for confirmed deployed PlayMCP/Kakao Tools browser origins.
 - `TASK_RUN_SECRET` is optional. Set it only when an external scheduler will call `/tasks/run-due-alerts`.
 - Do not commit `.env`, API keys, OAuth tokens, or `playmcp.db`.
@@ -221,6 +233,7 @@ If `TASK_RUN_SECRET` is not set, this endpoint returns 404.
 
 - Seoul Open Data: `AccInfo`, Seoul real-time traffic incident information.
 - Kakao Local API: address search and coordinate transform.
+- ODsay API: public-transit route candidate lookup and selected route geometry.
 - Kakao Login and KakaoTalk Message API: OAuth and self-message delivery.
 
 User-facing summaries must not expose raw API payloads.
@@ -232,6 +245,8 @@ OAuth callback failures return a generic reconnect message.
 - Stores user alert areas, schedules, and OAuth tokens in SQLite.
 - Separates data by user id from PlayMCP-related headers when present.
 - Falls back to `local` only for local single-user development.
+- Encrypts newly saved OAuth tokens when `TOKEN_ENCRYPTION_KEY` is configured.
+- Rejects oversized MCP request bodies, oversized JSON-RPC batches, excessive per-user calls, and duplicate KakaoTalk sends.
 - Does not read KakaoTalk chat history, chat rooms, files, or local app storage.
 - Does not send messages to friends or group chats.
 - Does not log API keys, client secrets, access tokens, or refresh tokens.
@@ -239,6 +254,8 @@ OAuth callback failures return a generic reconnect message.
 ## Known limitations
 
 - User identity header names must be confirmed against the actual PlayMCP runtime.
+- Header spoofing can only be fully prevented if PlayMCP or the ingress strips external spoofed user headers or provides a signed/trusted identity boundary.
+- Current implementation exposes 10 submission-facing tools, within the PlayMCP recommended 3-10 range.
 - Scheduled alerts run only while the server process is alive.
-- Public API MVP supports point-and-radius areas, not route buffers or transit-route buffers.
-- Deployed OAuth must be retested after the final PlayMCP in KC endpoint is issued.
+- Public-transit route registration uses ODsay candidates and stores selected route geometry. Use `loadLane` graph geometry first if route-line precision becomes a review requirement.
+- Deployed OAuth and user separation must be retested after the final PlayMCP in KC endpoint and user-id header are confirmed.

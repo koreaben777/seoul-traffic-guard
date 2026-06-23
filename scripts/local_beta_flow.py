@@ -51,11 +51,11 @@ def main() -> None:
     )
     listed = call_tool("list_alert_areas", {}, 3)
     issues = call_tool("check_traffic_issues", {"label": AREA_LABEL}, 4)
-    preview = call_tool("preview_alert_message", {"label": AREA_LABEL, "issue_summary": issues.splitlines()[0]}, 5)
+    dry_run = call_tool("send_self_alert", {"message": f"[서울 교통 이슈 알리미]\n{issues.splitlines()[0]}", "dry_run": True}, 5)
 
     assert AREA_LABEL in registered
     assert AREA_LABEL in listed
-    assert preview.startswith("[서울 교통 이슈 알리미]")
+    assert "Dry run only" in dry_run
     print("local beta flow ok")
     print(issues)
 

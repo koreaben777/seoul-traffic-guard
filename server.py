@@ -30,11 +30,38 @@ OAUTH_TOKENS: dict[str, dict[str, Any]] = {}
 OAUTH_STATE: dict[str, str] = {}
 REGION_CACHE: dict[tuple[int, int], dict[str, Any]] = {}
 TRANSIT_ROUTE_OPTIONS: dict[str, dict[str, list[dict[str, Any]]]] = {}
+RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
+ACCINFO_CACHE: dict[str, Any] = {}
+SENT_MESSAGE_GUARD: dict[tuple[str, str], float] = {}
 SCHEDULER_STARTED = False
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 MCP_ENDPOINTS = {"/", "/mcp"}
 REQUIRED_ENV_VARS = ("KAKAO_REST_API_KEY", "KAKAO_REDIRECT_URI", "SEOUL_OPENAPI_KEY")
-OPTIONAL_ENV_VARS = ("KAKAO_CLIENT_SECRET", "ALLOWED_ORIGINS", "TASK_RUN_SECRET", "PLAYMCP_DB_PATH", "PLAYMCP_USER_ID_HEADERS")
+OPTIONAL_ENV_VARS = (
+    "KAKAO_CLIENT_SECRET",
+    "ALLOWED_ORIGINS",
+    "TASK_RUN_SECRET",
+    "PLAYMCP_DB_PATH",
+    "PLAYMCP_USER_ID_HEADERS",
+    "REQUIRE_USER_ID_HEADER",
+    "MAX_REQUEST_BYTES",
+    "MAX_BATCH_REQUESTS",
+    "TOKEN_ENCRYPTION_KEY",
+    "ODSAY_API_KEY",
+)
+GENERIC_TOOL_ERROR = "도구 호출을 처리할 수 없습니다. 입력값을 확인해 주세요."
+GENERIC_REQUEST_ERROR = "잘못된 MCP 요청입니다."
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "262144"))
+MAX_BATCH_REQUESTS = int(os.environ.get("MAX_BATCH_REQUESTS", "20"))
+BATCH_TOO_LARGE_ERROR = "MCP batch request is too large."
+RATE_LIMIT_WINDOW_SECONDS = 60
+SEND_SELF_ALERT_RATE_LIMIT = 6
+OTHER_TOOL_CALL_RATE_LIMIT = 60
+OTHER_TOOL_RATE_KEY = "__other_tools__"
+RATE_LIMIT_MESSAGE = "요청이 많습니다. 잠시 후 다시 시도해 주세요."
+ACCINFO_CACHE_TTL_SECONDS = 30
+DUPLICATE_SEND_WINDOW_SECONDS = 60
+DUPLICATE_SEND_MESSAGE = "이미 같은 알림을 방금 보냈습니다. 잠시 후 다시 시도해 주세요."
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -72,77 +99,31 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "set_route_alert_area",
-        "description": "Register a route corridor alert area from an origin, destination, and corridor radius.",
+        "name": "delete_alert_area",
+        "description": "Delete a registered Seoul Traffic Guard alert area by label.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "label": {"type": "string", "description": "User-facing route label, for example 출근길 or 등교길."},
-                "origin": {"type": "string", "description": "Route origin address or place keyword."},
-                "destination": {"type": "string", "description": "Route destination address or place keyword."},
-                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 700},
-            },
-            "required": ["label", "origin", "destination"],
+            "properties": {"label": {"type": "string", "description": "Alert area label to delete."}},
+            "required": ["label"],
             "additionalProperties": False,
         },
         "annotations": {
-            "title": "Set route alert area",
+            "title": "Delete alert area",
             "readOnlyHint": False,
-            "destructiveHint": False,
-            "openWorldHint": True,
-            "idempotentHint": True,
-        },
-    },
-    {
-        "name": "set_transit_route_alert_area",
-        "description": "Register a public-transit route alert area from subway station or bus stop names.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string", "description": "User-facing transit route label, for example 지하철출근길."},
-                "stops": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 20,
-                    "items": {"type": "string"},
-                    "description": "Subway station or bus stop names on the route, for example 이촌역.",
-                },
-                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 500},
-            },
-            "required": ["label", "stops"],
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "title": "Set transit route alert area",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "openWorldHint": True,
+            "destructiveHint": True,
+            "openWorldHint": False,
             "idempotentHint": True,
         },
     },
     {
         "name": "find_transit_route_options",
-        "description": "Prepare selectable public-transit route options from origin, destination, and candidate stops.",
+        "description": "Find selectable public-transit route options from origin and destination using ODsay.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "label": {"type": "string", "description": "User-facing route label to save after selection."},
                 "origin": {"type": "string", "description": "Route origin place keyword."},
                 "destination": {"type": "string", "description": "Route destination place keyword."},
-                "via_stops": {"type": "array", "items": {"type": "string"}, "description": "Optional stop candidates."},
-                "route_options": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "stops": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["stops"],
-                        "additionalProperties": False,
-                    },
-                    "description": "Candidate route stop lists already found from Kakao Map or user context.",
-                },
             },
             "required": ["label", "origin", "destination"],
             "additionalProperties": False,
@@ -177,60 +158,6 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "set_district_alert_area",
-        "description": "Register an exact administrative dong alert area from a Seoul dong name.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string", "description": "User-facing district area label."},
-                "district": {"type": "string", "description": "Seoul administrative dong name, for example 역삼1동."},
-                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 2500},
-            },
-            "required": ["label", "district"],
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "title": "Set district alert area",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "openWorldHint": True,
-            "idempotentHint": True,
-        },
-    },
-    {
-        "name": "set_alert_areas",
-        "description": "Register multiple point-and-radius alert areas in one call.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "areas": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 10,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "address": {"type": "string"},
-                            "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 1000},
-                        },
-                        "required": ["label", "address"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["areas"],
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "title": "Set alert areas",
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "openWorldHint": True,
-            "idempotentHint": True,
-        },
-    },
-    {
         "name": "check_traffic_issues",
         "description": "Check real-time Seoul traffic issues near registered alert areas.",
         "inputSchema": {
@@ -245,26 +172,6 @@ TOOLS: list[dict[str, Any]] = [
             "readOnlyHint": True,
             "destructiveHint": False,
             "openWorldHint": True,
-            "idempotentHint": True,
-        },
-    },
-    {
-        "name": "preview_alert_message",
-        "description": "Preview the notification text before sending it to the user's own chat.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string", "description": "Alert area label."},
-                "issue_summary": {"type": "string", "description": "Traffic issue summary to include."},
-            },
-            "required": ["label", "issue_summary"],
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "title": "Preview alert message",
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "openWorldHint": False,
             "idempotentHint": True,
         },
     },
@@ -428,13 +335,23 @@ def normalize_user_id(raw: str | None) -> str:
     return "u_" + sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
+class UserIdentityRequired(ValueError):
+    pass
+
+
+def env_bool(name: str) -> bool:
+    return env_value(name).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def user_id_from_headers(headers: Any) -> str:
     configured = tuple(name.strip().lower() for name in env_value("PLAYMCP_USER_ID_HEADERS").split(",") if name.strip())
-    # ponytail: provisional PlayMCP user boundary; env lets deploys add the confirmed header without a code change.
-    for name in configured + USER_ID_HEADERS:
+    # ponytail: header trust still depends on PlayMCP ingress stripping spoofed external headers.
+    for name in configured or USER_ID_HEADERS:
         value = headers.get(name)
         if value:
             return normalize_user_id(value)
+    if env_bool("REQUIRE_USER_ID_HEADER"):
+        raise UserIdentityRequired("user identity header is required")
     return DEFAULT_USER_ID
 
 
@@ -452,6 +369,35 @@ def user_scheduled_alerts(user_id: str) -> dict[str, dict[str, Any]]:
 
 def user_oauth_tokens(user_id: str) -> dict[str, Any]:
     return OAUTH_TOKENS.setdefault(user_id, {})
+
+
+def rate_limited(user_id: str, tool_name: str, now: float | None = None) -> bool:
+    now = now or time_module.time()
+    bucket = "send_self_alert" if tool_name == "send_self_alert" else OTHER_TOOL_RATE_KEY
+    limit = SEND_SELF_ALERT_RATE_LIMIT if tool_name == "send_self_alert" else OTHER_TOOL_CALL_RATE_LIMIT
+    key = (user_id, bucket)
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    recent = [stamp for stamp in RATE_LIMITS.get(key, []) if stamp > cutoff]
+    if len(recent) >= limit:
+        RATE_LIMITS[key] = recent
+        return True
+    recent.append(now)
+    RATE_LIMITS[key] = recent
+    return False
+
+
+def duplicate_send_key(user_id: str, message: str) -> tuple[str, str]:
+    return user_id, sha256(message.encode("utf-8")).hexdigest()
+
+
+def duplicate_send_blocked(user_id: str, message: str, now: float | None = None) -> bool:
+    now = now or time_module.time()
+    last_sent = SENT_MESSAGE_GUARD.get(duplicate_send_key(user_id, message))
+    return bool(last_sent and now - last_sent <= DUPLICATE_SEND_WINDOW_SECONDS)
+
+
+def remember_sent_message(user_id: str, message: str, now: float | None = None) -> None:
+    SENT_MESSAGE_GUARD[duplicate_send_key(user_id, message)] = now or time_module.time()
 
 
 def ensure_user_table(conn: sqlite3.Connection, table: str, create_sql: str, migrate_sql: str) -> None:
@@ -532,6 +478,11 @@ def save_alert_area(area: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> Non
         )
 
 
+def delete_alert_area_db(label: str, user_id: str = DEFAULT_USER_ID) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM alert_areas WHERE user_id = ? AND label = ?", (user_id, label))
+
+
 def save_scheduled_alert(schedule: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> None:
     with db_connect() as conn:
         conn.execute(
@@ -545,11 +496,37 @@ def delete_scheduled_alert_db(label: str, user_id: str = DEFAULT_USER_ID) -> Non
         conn.execute("DELETE FROM scheduled_alerts WHERE user_id = ? AND label = ?", (user_id, label))
 
 
+def token_cipher() -> Any:
+    key = env_value("TOKEN_ENCRYPTION_KEY")
+    if not key:
+        return None
+    from cryptography.fernet import Fernet
+
+    return Fernet(key.encode("utf-8"))
+
+
+def encode_oauth_data(tokens: dict[str, Any]) -> str:
+    raw = json.dumps(tokens, ensure_ascii=False)
+    cipher = token_cipher()
+    if not cipher:
+        return raw
+    return "fernet:" + cipher.encrypt(raw.encode("utf-8")).decode("utf-8")
+
+
+def decode_oauth_data(data: str) -> dict[str, Any]:
+    if not data.startswith("fernet:"):
+        return json.loads(data)
+    cipher = token_cipher()
+    if not cipher:
+        raise ValueError("TOKEN_ENCRYPTION_KEY is required to read OAuth tokens")
+    return json.loads(cipher.decrypt(data.removeprefix("fernet:").encode("utf-8")).decode("utf-8"))
+
+
 def save_oauth_tokens(tokens: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> None:
     with db_connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO oauth_tokens(user_id, data) VALUES (?, ?)",
-            (user_id, json.dumps(tokens, ensure_ascii=False)),
+            (user_id, encode_oauth_data(tokens)),
         )
 
 
@@ -563,7 +540,7 @@ def load_state() -> None:
         for user_id, label, data in conn.execute("SELECT user_id, label, data FROM scheduled_alerts"):
             user_scheduled_alerts(user_id)[label] = json.loads(data)
         for user_id, data in conn.execute("SELECT user_id, data FROM oauth_tokens"):
-            OAUTH_TOKENS[user_id] = json.loads(data)
+            OAUTH_TOKENS[user_id] = decode_oauth_data(data)
 
 
 def kakao_json(path: str, query: dict[str, str]) -> dict[str, Any]:
@@ -584,6 +561,35 @@ def kakao_mobility_json(path: str, query: dict[str, str]) -> dict[str, Any]:
     req = urllib.request.Request(url, headers={"Authorization": f"KakaoAK {key}"})
     with urllib.request.urlopen(req, timeout=10) as res:
         return json.loads(res.read().decode("utf-8"))
+
+
+def odsay_json(path: str, query: dict[str, str]) -> dict[str, Any]:
+    key = env_value("ODSAY_API_KEY")
+    if not key:
+        raise ValueError("ODSAY_API_KEY is not configured")
+    url = f"https://api.odsay.com/v1/api{path}?{urllib.parse.urlencode({**query, 'apiKey': key})}"
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as res:
+                data = json.loads(res.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                data = json.loads(exc.read().decode("utf-8"))
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                last_error = exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+        if attempt < 4:
+            # ponytail: fixed delay; make it exponential only if ODsay rate-limits retries.
+            time_module.sleep(2)
+    else:
+        raise last_error or urllib.error.URLError("ODsay API failed")
+    if any("ApiKeyAuthFailed" in str(error.get("message", "")) for error in data.get("error") or []):
+        raise ValueError("ODSAY_AUTH_FAILED")
+    return data
 
 
 def app_base_url() -> str:
@@ -715,7 +721,14 @@ def validate_radius(radius_m: Any, default: int = 1000) -> int:
     return radius
 
 
+def is_bare_road_name(query: str) -> bool:
+    compact = "".join(query.split())
+    return bool(compact) and not any(ch.isdigit() for ch in compact) and compact.endswith(("대로", "로", "길"))
+
+
 def geocode_address(address: str) -> dict[str, Any]:
+    if is_bare_road_name(address):
+        raise ValueError(f"Address is too broad; use a more specific Seoul address or place name: {address}")
     data = kakao_json("/v2/local/search/keyword.json", {"query": address})
     docs = data.get("documents") or []
     if not docs:
@@ -840,44 +853,110 @@ def normalize_stop_names(values: list[Any]) -> list[str]:
     return stops
 
 
+def odsay_lane_name(lane: Any) -> str:
+    lanes = lane if isinstance(lane, list) else [lane]
+    names = []
+    for item in lanes:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("busNo") or item.get("busNoKor") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return "/".join(names) if names else "대중교통"
+
+
+def odsay_station_name(name: Any, traffic_type: int, suffix: bool = False) -> str:
+    text = str(name or "").strip()
+    if suffix and traffic_type == 1 and text and not text.endswith("역"):
+        return f"{text}역"
+    return text
+
+
+def odsay_segment_summary(segment: dict[str, Any], suffix: bool = False) -> str:
+    traffic_type = int(segment.get("trafficType") or 0)
+    lane = odsay_lane_name(segment.get("lane"))
+    start = odsay_station_name(segment.get("startName"), traffic_type, suffix)
+    end = odsay_station_name(segment.get("endName"), traffic_type, suffix)
+    if suffix:
+        return f"{lane} {start}부터 {end}까지"
+    return f"{lane} {start}-{end}"
+
+
+def odsay_transit_segments(path: dict[str, Any]) -> list[dict[str, Any]]:
+    segments = []
+    for segment in path.get("subPath") or []:
+        if int(segment.get("trafficType") or 0) in (1, 2):
+            segments.append(segment)
+    return segments
+
+
+def odsay_route_points(map_obj: str) -> list[dict[str, float]]:
+    data = odsay_json("/loadLane", {"mapObject": map_obj if "@" in map_obj else f"0:0@{map_obj}"})
+    points: list[dict[str, float]] = []
+    for lane in (data.get("result") or {}).get("lane") or []:
+        for section in lane.get("section") or []:
+            for pos in section.get("graphPos") or []:
+                tm = wgs84_to_tm(float(pos["x"]), float(pos["y"]), "odsay-route")
+                points.append({"tm_x": tm["tm_x"], "tm_y": tm["tm_y"]})
+    if not points:
+        raise ValueError("ODsay route geometry is empty")
+    return points
+
+
+def odsay_segment_points(segments: list[dict[str, Any]]) -> list[dict[str, float]]:
+    points: list[dict[str, float]] = []
+    for segment in segments:
+        stations = (segment.get("passStopList") or {}).get("stations") or []
+        candidates = stations or [
+            {"x": segment.get("startX"), "y": segment.get("startY")},
+            {"x": segment.get("endX"), "y": segment.get("endY")},
+        ]
+        for item in candidates:
+            try:
+                tm = wgs84_to_tm(float(item["x"]), float(item["y"]), "odsay-route")
+            except (KeyError, TypeError, ValueError):
+                continue
+            points.append({"tm_x": tm["tm_x"], "tm_y": tm["tm_y"]})
+    return points
+
+
 def build_transit_route_options(args: dict[str, Any]) -> list[dict[str, Any]]:
     origin = str(args["origin"]).strip()
     destination = str(args["destination"]).strip()
     if not origin or not destination:
         raise ValueError("origin and destination are required")
+    if not env_value("ODSAY_API_KEY"):
+        raise ValueError("ODSAY_API_KEY is not configured")
+
+    origin_geo = geocode_address(origin)
+    destination_geo = geocode_address(destination)
+    data = odsay_json(
+        "/searchPubTransPathT",
+        {"SX": str(origin_geo["x"]), "SY": str(origin_geo["y"]), "EX": str(destination_geo["x"]), "EY": str(destination_geo["y"]), "OPT": "0"},
+    )
+    if any("ApiKeyAuthFailed" in str(error.get("message", "")) for error in data.get("error") or []):
+        raise ValueError("ODSAY_AUTH_FAILED")
 
     options: list[dict[str, Any]] = []
-    route_options = args.get("route_options")
-    if isinstance(route_options, list) and route_options:
-        for index, raw in enumerate(route_options[:5], start=1):
-            if not isinstance(raw, dict):
-                continue
-            stops = normalize_stop_names(raw.get("stops") or [])
-            if not stops:
-                continue
-            route_id = f"route-{index}"
-            options.append(
-                {
-                    "route_id": route_id,
-                    "name": str(raw.get("name") or route_id).strip() or route_id,
-                    "stops": stops,
-                    "points": transit_points(stops),
-                }
-            )
-    else:
-        via_stops = args.get("via_stops") if isinstance(args.get("via_stops"), list) else []
-        stops = normalize_stop_names([origin, *via_stops, destination])
-        options.append({"route_id": "route-1", "name": "직접 입력 경로", "stops": stops, "points": transit_points(stops)})
-        for index, stop in enumerate(normalize_stop_names(via_stops)[:4], start=2):
-            sub_stops = normalize_stop_names([origin, stop, destination])
-            options.append(
-                {
-                    "route_id": f"route-{index}",
-                    "name": f"{stop} 경유",
-                    "stops": sub_stops,
-                    "points": transit_points(sub_stops),
-                }
-            )
+    for index, path in enumerate(((data.get("result") or {}).get("path") or [])[:5], start=1):
+        segments = odsay_transit_segments(path)
+        if not segments:
+            continue
+        info = path.get("info") or {}
+        map_obj = str(info.get("mapObj") or "").strip()
+        if not map_obj:
+            continue
+        summary = ", ".join(odsay_segment_summary(segment) for segment in segments)
+        options.append(
+            {
+                "route_id": str(index),
+                "name": summary,
+                "segments": segments,
+                "map_obj": map_obj,
+                "total_time": info.get("totalTime"),
+                "payment": info.get("payment"),
+            }
+        )
 
     if not options:
         raise ValueError("route options must include at least one stop list")
@@ -885,29 +964,38 @@ def build_transit_route_options(args: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def transit_route_options_text(options: list[dict[str, Any]]) -> str:
-    lines = ["아래 후보 경로 중 등록할 route_id를 선택해 주세요."]
+    lines = ["후보 대중교통 경로입니다."]
     for option in options:
-        lines.append(f"[ ] {option['route_id']} - {option['name']}: " + " -> ".join(option["stops"]))
-    lines.append("선택 후 set_selected_transit_route_alert_area에 선택한 route_id 목록을 전달하면 등록됩니다.")
+        time_text = f" / 약 {option['total_time']}분" if option.get("total_time") is not None else ""
+        lines.append(f"{option['route_id']}. {option['name']}{time_text}")
+    lines.append("원하는 번호를 말하면 해당 경로를 등록할 수 있습니다.")
     return "\n".join(lines)
 
 
 def selected_transit_points(options: list[dict[str, Any]], route_ids: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
-    wanted = {str(route_id).strip() for route_id in route_ids if str(route_id).strip()}
+    wanted = {str(route_id).strip().removeprefix("route-") for route_id in route_ids if str(route_id).strip()}
     selected = [option for option in options if option["route_id"] in wanted]
     if not selected:
         raise ValueError("selected route ids were not found")
 
     points: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, int]] = set()
+    seen: set[tuple[int, int]] = set()
+    selected_names: list[str] = []
     for option in selected:
-        for point in option["points"]:
-            key = (str(point.get("stop", "")), round(float(point["tm_x"])), round(float(point["tm_y"])))
+        selected_names.extend(odsay_segment_summary(segment, suffix=True) for segment in option.get("segments") or [])
+        try:
+            route_points = odsay_route_points(option["map_obj"])
+        except (urllib.error.URLError, ValueError):
+            # ponytail: passStopList fallback keeps route selection usable when loadLane is unavailable.
+            route_points = []
+        route_points = route_points or odsay_segment_points(option.get("segments") or [])
+        for point in route_points:
+            key = (round(float(point["tm_x"])), round(float(point["tm_y"])))
             if key in seen:
                 continue
             points.append(point)
             seen.add(key)
-    return points, [f"{option['route_id']}({option['name']})" for option in selected]
+    return points, selected_names
 
 
 def fetch_accinfo(limit: int = 1000) -> list[dict[str, Any]]:
@@ -935,6 +1023,27 @@ def fetch_accinfo(limit: int = 1000) -> list[dict[str, Any]]:
     return rows
 
 
+def fetch_accinfo_cached(limit: int = 1000) -> list[dict[str, Any]]:
+    now = time_module.time()
+    cached_at = float(ACCINFO_CACHE.get("cached_at") or 0)
+    if ACCINFO_CACHE.get("limit") == limit and now - cached_at <= ACCINFO_CACHE_TTL_SECONDS:
+        return list(ACCINFO_CACHE["rows"])
+    rows = fetch_accinfo(limit)
+    ACCINFO_CACHE.update({"limit": limit, "cached_at": now, "rows": rows})
+    return rows
+
+
+def fetch_accinfo_retry(limit: int = 1000, attempts: int = 3) -> tuple[list[dict[str, Any]], int]:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_accinfo_cached(limit), attempt
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+            # ponytail: no backoff; add one only if the public API starts rate-limiting retries.
+    raise last_error or urllib.error.URLError("traffic API retry failed")
+
+
 def point_distance_m(point: dict[str, Any], issue: dict[str, Any]) -> float | None:
     try:
         dx = float(point["tm_x"]) - float(issue["grs80tm_x"])
@@ -942,6 +1051,21 @@ def point_distance_m(point: dict[str, Any], issue: dict[str, Any]) -> float | No
     except (KeyError, TypeError, ValueError):
         return None
     return (dx * dx + dy * dy) ** 0.5
+
+
+def segment_distance_m(a: dict[str, Any], b: dict[str, Any], issue: dict[str, Any]) -> float | None:
+    try:
+        ax, ay = float(a["tm_x"]), float(a["tm_y"])
+        bx, by = float(b["tm_x"]), float(b["tm_y"])
+        px, py = float(issue["grs80tm_x"]), float(issue["grs80tm_y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    x, y = ax + t * dx, ay + t * dy
+    return ((px - x) ** 2 + (py - y) ** 2) ** 0.5
 
 
 def distance_m(area: dict[str, Any], issue: dict[str, Any]) -> float | None:
@@ -952,6 +1076,13 @@ def distance_m(area: dict[str, Any], issue: dict[str, Any]) -> float | None:
             return None
     points = area.get("points")
     if isinstance(points, list) and points:
+        if area.get("area_type") == "transit_route_polyline" and len(points) > 1:
+            distances = [
+                distance
+                for a, b in zip(points, points[1:])
+                if (distance := segment_distance_m(a, b, issue)) is not None
+            ]
+            return min(distances) if distances else None
         distances = [distance for point in points if (distance := point_distance_m(point, issue)) is not None]
         return min(distances) if distances else None
     return point_distance_m(area, issue)
@@ -1149,6 +1280,9 @@ def server_address() -> tuple[str, int]:
 
 
 def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+    if rate_limited(user_id, name):
+        return text_result(RATE_LIMIT_MESSAGE)
+
     areas = user_alert_areas(user_id)
     transit_options = user_transit_route_options(user_id)
     schedules = user_scheduled_alerts(user_id)
@@ -1169,61 +1303,6 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         save_alert_area(areas[label], user_id)
         return text_result(f"Registered alert area '{label}' at {geo['address_name']} with radius {radius_m}m.")
 
-    if name == "set_route_alert_area":
-        label = str(args["label"]).strip()
-        origin_text = str(args["origin"]).strip()
-        destination_text = str(args["destination"]).strip()
-        radius_m = validate_radius(args.get("radius_m"), 700)
-        if not label or not origin_text or not destination_text:
-            raise ValueError("label, origin, and destination are required")
-        try:
-            origin = geocode_address(origin_text)
-            destination = geocode_address(destination_text)
-            points = route_points(origin, destination)
-        except urllib.error.URLError:
-            return text_result("경로 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
-        except ValueError:
-            return text_result("출발지나 도착지를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
-        area = {
-            "label": label,
-            "area_type": "route_corridor",
-            "address": f"{origin_text} -> {destination_text}",
-            "address_name": f"{origin['address_name']} -> {destination['address_name']}",
-            "radius_m": radius_m,
-            "tm_x": points[0]["tm_x"],
-            "tm_y": points[0]["tm_y"],
-            "points": points,
-        }
-        areas[label] = area
-        save_alert_area(area, user_id)
-        return text_result(f"Registered route alert area '{label}' from {origin_text} to {destination_text} with corridor radius {radius_m}m.")
-
-    if name == "set_transit_route_alert_area":
-        label = str(args["label"]).strip()
-        stops = args.get("stops")
-        radius_m = validate_radius(args.get("radius_m"), 500)
-        if not label or not isinstance(stops, list) or not stops:
-            raise ValueError("label and stops are required")
-        try:
-            points = transit_points([str(stop) for stop in stops])
-        except urllib.error.URLError:
-            return text_result("대중교통 경유지 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
-        except ValueError:
-            return text_result("경유 역이나 정류장을 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
-        area = {
-            "label": label,
-            "area_type": "transit_stops",
-            "address": " -> ".join(point["stop"] for point in points),
-            "address_name": " -> ".join(point["stop"] for point in points),
-            "radius_m": radius_m,
-            "tm_x": points[0]["tm_x"],
-            "tm_y": points[0]["tm_y"],
-            "points": points,
-        }
-        areas[label] = area
-        save_alert_area(area, user_id)
-        return text_result(f"Registered transit alert area '{label}' for stops: {area['address_name']} with radius {radius_m}m.")
-
     if name == "find_transit_route_options":
         label = str(args["label"]).strip()
         if not label:
@@ -1231,9 +1310,13 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         try:
             options = build_transit_route_options(args)
         except urllib.error.URLError:
-            return text_result("대중교통 후보 경로 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
-        except ValueError:
-            return text_result("대중교통 후보 경로를 만들 수 없습니다. 출발지, 도착지, 경유 후보를 더 구체적으로 입력해 주세요.")
+            return text_result("ODsay 대중교통 경로 API 응답이 지연되어 5번 재시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        except ValueError as exc:
+            if "ODSAY_API_KEY" in str(exc):
+                return text_result("대중교통 경로 조회에는 ODSAY_API_KEY 설정이 필요합니다.")
+            if "ODSAY_AUTH_FAILED" in str(exc):
+                return text_result("ODsay API 인증에 실패했습니다. .env의 ODSAY_API_KEY가 Server API Key인지, ODsay 설정의 Server IP 허용 목록에 현재 호출 서버의 공인 IP가 들어있는지 확인해 주세요.")
+            return text_result("대중교통 후보 경로를 만들 수 없습니다. 출발지와 도착지를 더 구체적으로 입력해 주세요.")
         transit_options[label] = options
         return text_result(transit_route_options_text(options))
 
@@ -1248,11 +1331,12 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
             return text_result("먼저 find_transit_route_options로 후보 경로를 조회해 주세요.")
         try:
             points, selected_names = selected_transit_points(options, route_ids)
+            selected_number = str(route_ids[0]).strip().removeprefix("route-")
         except ValueError:
             return text_result("선택한 route_id를 찾을 수 없습니다. 후보 목록의 route_id를 그대로 선택해 주세요.")
         area = {
             "label": label,
-            "area_type": "transit_selected_routes",
+            "area_type": "transit_route_polyline",
             "address": ", ".join(selected_names),
             "address_name": ", ".join(selected_names),
             "radius_m": radius_m,
@@ -1262,41 +1346,7 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         }
         areas[label] = area
         save_alert_area(area, user_id)
-        return text_result(f"Registered selected transit route area '{label}' for {', '.join(selected_names)} with radius {radius_m}m.")
-
-    if name == "set_district_alert_area":
-        label = str(args["label"]).strip()
-        district = str(args["district"]).strip()
-        if not label or not district:
-            raise ValueError("label and district are required")
-        try:
-            geo = admin_dong_for_text(district)
-        except urllib.error.URLError:
-            return text_result("행정동 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
-        except ValueError:
-            return text_result("행정동을 찾을 수 없습니다. 구 이름과 함께 더 구체적으로 입력해 주세요.")
-        area = {"label": label, "area_type": "admin_dong", "address": district, "radius_m": 0, **geo}
-        areas[label] = area
-        save_alert_area(area, user_id)
-        return text_result(f"Registered administrative dong alert area '{label}' for {geo['address_name']}.")
-
-    if name == "set_alert_areas":
-        items = args.get("areas")
-        if not isinstance(items, list) or not items:
-            raise ValueError("areas must be a non-empty list")
-        registered: list[str] = []
-        for item in items[:10]:
-            label = str(item["label"]).strip()
-            address = str(item["address"]).strip()
-            radius_m = validate_radius(item.get("radius_m"), 1000)
-            if not label or not address:
-                raise ValueError("each area requires label and address")
-            geo = geocode_address(address)
-            area = {"label": label, "area_type": "point_circle", "address": address, "radius_m": radius_m, **geo}
-            areas[label] = area
-            save_alert_area(area, user_id)
-            registered.append(f"{label}({geo['address_name']}, {radius_m}m)")
-        return text_result("Registered alert areas: " + ", ".join(registered))
+        return text_result(f"{selected_number}번 경로를 {label}로 등록했습니다. {', '.join(selected_names)}가 등록되었습니다.")
 
     if name == "list_alert_areas":
         if not areas:
@@ -1307,6 +1357,14 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         ]
         return text_result("\n".join(lines))
 
+    if name == "delete_alert_area":
+        label = str(args["label"]).strip()
+        if not label:
+            raise ValueError("label is required")
+        areas.pop(label, None)
+        delete_alert_area_db(label, user_id)
+        return text_result(f"Deleted alert area '{label}'.")
+
     if name == "check_traffic_issues":
         label = args.get("label")
         if label and label not in areas:
@@ -1315,15 +1373,16 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
             return text_result("No alert areas registered.")
         selected_areas = [areas[label]] if label else list(areas.values())
         try:
-            matches = traffic_issue_lines(selected_areas, fetch_accinfo())
-        except (ValueError, urllib.error.URLError):
+            issues, attempt = fetch_accinfo_retry()
+            matches = traffic_issue_lines(selected_areas, issues)
+        except ValueError:
             return text_result("교통 정보 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+        except (TimeoutError, urllib.error.URLError):
+            return text_result("교통 정보 API 응답이 지연되어 3번 재시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        prefix = "교통 정보 API 응답 지연으로 재시도 후 조회했습니다.\n" if attempt > 1 else ""
         if not matches:
-            return text_result("등록 지역 주변 확인된 교통 이슈 없음")
-        return text_result("\n".join(matches))
-
-    if name == "preview_alert_message":
-        return text_result(f"[서울 교통 이슈 알리미]\n{args['label']}: {args['issue_summary']}")
+            return text_result(prefix + "등록 지역 주변 확인된 교통 이슈 없음")
+        return text_result(prefix + "\n".join(matches))
 
     if name == "send_self_alert":
         if args.get("dry_run", True):
@@ -1331,11 +1390,17 @@ def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -
         message = str(args["message"]).strip()
         if not message:
             raise ValueError("message is required")
+        if duplicate_send_blocked(user_id, message):
+            return text_result(DUPLICATE_SEND_MESSAGE)
         try:
             send_kakao_self_message(message, user_id)
+            remember_sent_message(user_id, message)
             return text_result("Sent alert to your KakaoTalk chat.")
         except ValueError as exc:
-            return text_result(str(exc))
+            message_text = str(exc)
+            if message_text.startswith("OAuth required."):
+                return text_result(message_text)
+            return text_result("알림 전송에 실패했습니다. OAuth를 다시 연결하거나 잠시 후 다시 시도해 주세요.")
         except urllib.error.URLError:
             return text_result("알림 전송에 실패했습니다. OAuth를 다시 연결하거나 잠시 후 다시 시도해 주세요.")
 
@@ -1392,8 +1457,8 @@ def handle_rpc(request: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> dict[
         try:
             result = call_tool(params["name"], params.get("arguments") or {}, user_id)
             return {"jsonrpc": "2.0", "id": request_id, "result": result}
-        except Exception as exc:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": str(exc)}}
+        except Exception:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": GENERIC_TOOL_ERROR}}
 
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
@@ -1461,10 +1526,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            user_id = user_id_from_headers(self.headers)
+            try:
+                user_id = user_id_from_headers(self.headers)
+            except UserIdentityRequired:
+                self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "User identity is required."}}, status=401)
+                return
             length = int(self.headers.get("content-length", "0"))
+            if length > MAX_REQUEST_BYTES:
+                self.send_json({"error": "request too large"}, status=413)
+                return
             payload = json.loads(self.rfile.read(length) or b"{}")
             if isinstance(payload, list):
+                if len(payload) > MAX_BATCH_REQUESTS:
+                    self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": BATCH_TOO_LARGE_ERROR}}, status=400)
+                    return
                 if not any(is_json_rpc_request(item) for item in payload):
                     self.send_empty(202)
                     return
@@ -1479,8 +1554,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_empty(202)
                 else:
                     self.send_json(response)
-        except Exception as exc:
-            self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}, status=400)
+        except Exception:
+            self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": GENERIC_REQUEST_ERROR}}, status=400)
 
     def send_json(self, payload: Any, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
