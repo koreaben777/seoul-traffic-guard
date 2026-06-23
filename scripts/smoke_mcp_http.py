@@ -53,7 +53,7 @@ def main() -> None:
 
     tools = rpc("tools/list")["result"]["tools"]
     names = [tool["name"] for tool in tools]
-    assert len(names) == 8, names
+    assert {"set_alert_area", "list_alert_areas", "check_traffic_issues"} <= set(names), names
     assert all("kakao" not in name.lower() for name in names), names
     assert all("annotations" in tool for tool in tools), names
 

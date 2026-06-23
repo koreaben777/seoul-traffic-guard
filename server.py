@@ -28,6 +28,8 @@ ALERT_AREAS: dict[str, dict[str, dict[str, Any]]] = {}
 SCHEDULED_ALERTS: dict[str, dict[str, dict[str, Any]]] = {}
 OAUTH_TOKENS: dict[str, dict[str, Any]] = {}
 OAUTH_STATE: dict[str, str] = {}
+REGION_CACHE: dict[tuple[int, int], dict[str, Any]] = {}
+TRANSIT_ROUTE_OPTIONS: dict[str, dict[str, list[dict[str, Any]]]] = {}
 SCHEDULER_STARTED = False
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 MCP_ENDPOINTS = {"/", "/mcp"}
@@ -66,6 +68,165 @@ TOOLS: list[dict[str, Any]] = [
             "readOnlyHint": True,
             "destructiveHint": False,
             "openWorldHint": False,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "set_route_alert_area",
+        "description": "Register a route corridor alert area from an origin, destination, and corridor radius.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "User-facing route label, for example 출근길 or 등교길."},
+                "origin": {"type": "string", "description": "Route origin address or place keyword."},
+                "destination": {"type": "string", "description": "Route destination address or place keyword."},
+                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 700},
+            },
+            "required": ["label", "origin", "destination"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Set route alert area",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "set_transit_route_alert_area",
+        "description": "Register a public-transit route alert area from subway station or bus stop names.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "User-facing transit route label, for example 지하철출근길."},
+                "stops": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {"type": "string"},
+                    "description": "Subway station or bus stop names on the route, for example 이촌역.",
+                },
+                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 500},
+            },
+            "required": ["label", "stops"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Set transit route alert area",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "find_transit_route_options",
+        "description": "Prepare selectable public-transit route options from origin, destination, and candidate stops.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "User-facing route label to save after selection."},
+                "origin": {"type": "string", "description": "Route origin place keyword."},
+                "destination": {"type": "string", "description": "Route destination place keyword."},
+                "via_stops": {"type": "array", "items": {"type": "string"}, "description": "Optional stop candidates."},
+                "route_options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "stops": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["stops"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Candidate route stop lists already found from Kakao Map or user context.",
+                },
+            },
+            "required": ["label", "origin", "destination"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Find transit route options",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "set_selected_transit_route_alert_area",
+        "description": "Register selected public-transit route options after the user chooses route ids.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Label used in find_transit_route_options."},
+                "route_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 500},
+            },
+            "required": ["label", "route_ids"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Set selected transit route alert area",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "set_district_alert_area",
+        "description": "Register an exact administrative dong alert area from a Seoul dong name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "User-facing district area label."},
+                "district": {"type": "string", "description": "Seoul administrative dong name, for example 역삼1동."},
+                "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 2500},
+            },
+            "required": ["label", "district"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Set district alert area",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+    },
+    {
+        "name": "set_alert_areas",
+        "description": "Register multiple point-and-radius alert areas in one call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "areas": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "address": {"type": "string"},
+                            "radius_m": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 1000},
+                        },
+                        "required": ["label", "address"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["areas"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Set alert areas",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
             "idempotentHint": True,
         },
     },
@@ -143,6 +304,12 @@ TOOLS: list[dict[str, Any]] = [
                 "time": {"type": "string", "description": "Run time in HH:MM, 24-hour format."},
                 "target_day": {"type": "string", "enum": ["today", "tomorrow"], "default": "today"},
                 "send_policy": {"type": "string", "enum": ["only_if_issues", "always"], "default": "only_if_issues"},
+                "skip_dates": {"type": "array", "items": {"type": "string"}, "description": "YYYY-MM-DD dates to skip, including holidays."},
+                "pause_start_date": {"type": "string", "description": "YYYY-MM-DD temporary pause start date."},
+                "pause_end_date": {"type": "string", "description": "YYYY-MM-DD temporary pause end date."},
+                "start_date": {"type": "string", "description": "YYYY-MM-DD schedule start date."},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD schedule end date."},
+                "interval_days": {"type": "integer", "minimum": 1, "maximum": 365, "description": "Run every N days from start_date."},
             },
             "required": ["label", "area_label", "weekdays", "time"],
             "additionalProperties": False,
@@ -275,6 +442,10 @@ def user_alert_areas(user_id: str) -> dict[str, dict[str, Any]]:
     return ALERT_AREAS.setdefault(user_id, {})
 
 
+def user_transit_route_options(user_id: str) -> dict[str, list[dict[str, Any]]]:
+    return TRANSIT_ROUTE_OPTIONS.setdefault(user_id, {})
+
+
 def user_scheduled_alerts(user_id: str) -> dict[str, dict[str, Any]]:
     return SCHEDULED_ALERTS.setdefault(user_id, {})
 
@@ -405,6 +576,16 @@ def kakao_json(path: str, query: dict[str, str]) -> dict[str, Any]:
         return json.loads(res.read().decode("utf-8"))
 
 
+def kakao_mobility_json(path: str, query: dict[str, str]) -> dict[str, Any]:
+    key = env_value("KAKAO_REST_API_KEY")
+    if not key:
+        raise ValueError("KAKAO_REST_API_KEY is not configured")
+    url = f"https://apis-navi.kakaomobility.com{path}?{urllib.parse.urlencode(query)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"KakaoAK {key}"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
 def app_base_url() -> str:
     redirect_uri = env_value("KAKAO_REDIRECT_URI") or "http://localhost:8000/auth/kakao/callback"
     parsed = urllib.parse.urlparse(redirect_uri)
@@ -527,6 +708,13 @@ def wgs84_to_tm(x: float, y: float, query: str) -> dict[str, float]:
     return {"tm_x": float(tm_docs[0]["x"]), "tm_y": float(tm_docs[0]["y"])}
 
 
+def validate_radius(radius_m: Any, default: int = 1000) -> int:
+    radius = int(radius_m or default)
+    if radius < 100 or radius > 5000:
+        raise ValueError("radius_m must be between 100 and 5000")
+    return radius
+
+
 def geocode_address(address: str) -> dict[str, Any]:
     data = kakao_json("/v2/local/search/keyword.json", {"query": address})
     docs = data.get("documents") or []
@@ -547,6 +735,179 @@ def geocode_address(address: str) -> dict[str, Any]:
         "y": y,
         **tm,
     }
+
+
+def region_for_coords(x: float, y: float, input_coord: str = "WGS84") -> dict[str, Any]:
+    data = kakao_json(
+        "/v2/local/geo/coord2regioncode.json",
+        {"x": str(x), "y": str(y), "input_coord": input_coord},
+    )
+    for doc in data.get("documents") or []:
+        if doc.get("region_type") == "H":
+            return doc
+    raise ValueError("No administrative dong for coordinate")
+
+
+def admin_dong_for_text(district: str) -> dict[str, Any]:
+    geo = geocode_address(district)
+    region = region_for_coords(float(geo["x"]), float(geo["y"]))
+    if region.get("region_1depth_name") not in {"서울", "서울특별시"}:
+        raise ValueError("Only Seoul administrative dongs are supported")
+    return {
+        **geo,
+        "address_name": region["address_name"],
+        "region_code": region["code"],
+        "region_1depth_name": region["region_1depth_name"],
+        "region_2depth_name": region["region_2depth_name"],
+        "region_3depth_name": region["region_3depth_name"],
+    }
+
+
+def admin_dong_for_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    x = float(issue["grs80tm_x"])
+    y = float(issue["grs80tm_y"])
+    key = (round(x), round(y))
+    if key not in REGION_CACHE:
+        REGION_CACHE[key] = region_for_coords(x, y, "TM")
+    return REGION_CACHE[key]
+
+
+def route_vertices(origin: dict[str, Any], destination: dict[str, Any]) -> list[tuple[float, float]]:
+    try:
+        data = kakao_mobility_json(
+            "/v1/directions",
+            {
+                "origin": f"{origin['x']},{origin['y']}",
+                "destination": f"{destination['x']},{destination['y']}",
+                "priority": "RECOMMEND",
+                "summary": "false",
+            },
+        )
+    except (KeyError, urllib.error.URLError, ValueError):
+        return []
+
+    coords: list[tuple[float, float]] = []
+    for route in data.get("routes") or []:
+        for section in route.get("sections") or []:
+            for road in section.get("roads") or []:
+                values = road.get("vertexes") or []
+                coords.extend((float(values[i]), float(values[i + 1])) for i in range(0, len(values) - 1, 2))
+        if coords:
+            break
+    return coords
+
+
+def route_points(origin: dict[str, Any], destination: dict[str, Any], samples: int = 10) -> list[dict[str, float]]:
+    coords = route_vertices(origin, destination)
+    if not coords:
+        # ponytail: straight corridor fallback; replace with mandatory Mobility route if precision matters.
+        coords = [
+            (
+                float(origin["x"]) + (float(destination["x"]) - float(origin["x"])) * i / (samples - 1),
+                float(origin["y"]) + (float(destination["y"]) - float(origin["y"])) * i / (samples - 1),
+            )
+            for i in range(samples)
+        ]
+
+    step = max(1, len(coords) // samples)
+    picked = coords[::step][:samples]
+    if coords[-1] not in picked:
+        picked.append(coords[-1])
+    return [wgs84_to_tm(x, y, "route") for x, y in picked]
+
+
+def transit_points(stops: list[str]) -> list[dict[str, Any]]:
+    points = []
+    for stop in stops[:20]:
+        name = str(stop).strip()
+        if not name:
+            continue
+        geo = geocode_address(name)
+        points.append({"stop": name, "tm_x": geo["tm_x"], "tm_y": geo["tm_y"]})
+    if not points:
+        raise ValueError("stops must include at least one stop name")
+    return points
+
+
+def normalize_stop_names(values: list[Any]) -> list[str]:
+    stops: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        stop = str(value).strip()
+        if stop and stop not in seen:
+            stops.append(stop)
+            seen.add(stop)
+    return stops
+
+
+def build_transit_route_options(args: dict[str, Any]) -> list[dict[str, Any]]:
+    origin = str(args["origin"]).strip()
+    destination = str(args["destination"]).strip()
+    if not origin or not destination:
+        raise ValueError("origin and destination are required")
+
+    options: list[dict[str, Any]] = []
+    route_options = args.get("route_options")
+    if isinstance(route_options, list) and route_options:
+        for index, raw in enumerate(route_options[:5], start=1):
+            if not isinstance(raw, dict):
+                continue
+            stops = normalize_stop_names(raw.get("stops") or [])
+            if not stops:
+                continue
+            route_id = f"route-{index}"
+            options.append(
+                {
+                    "route_id": route_id,
+                    "name": str(raw.get("name") or route_id).strip() or route_id,
+                    "stops": stops,
+                    "points": transit_points(stops),
+                }
+            )
+    else:
+        via_stops = args.get("via_stops") if isinstance(args.get("via_stops"), list) else []
+        stops = normalize_stop_names([origin, *via_stops, destination])
+        options.append({"route_id": "route-1", "name": "직접 입력 경로", "stops": stops, "points": transit_points(stops)})
+        for index, stop in enumerate(normalize_stop_names(via_stops)[:4], start=2):
+            sub_stops = normalize_stop_names([origin, stop, destination])
+            options.append(
+                {
+                    "route_id": f"route-{index}",
+                    "name": f"{stop} 경유",
+                    "stops": sub_stops,
+                    "points": transit_points(sub_stops),
+                }
+            )
+
+    if not options:
+        raise ValueError("route options must include at least one stop list")
+    return options
+
+
+def transit_route_options_text(options: list[dict[str, Any]]) -> str:
+    lines = ["아래 후보 경로 중 등록할 route_id를 선택해 주세요."]
+    for option in options:
+        lines.append(f"[ ] {option['route_id']} - {option['name']}: " + " -> ".join(option["stops"]))
+    lines.append("선택 후 set_selected_transit_route_alert_area에 선택한 route_id 목록을 전달하면 등록됩니다.")
+    return "\n".join(lines)
+
+
+def selected_transit_points(options: list[dict[str, Any]], route_ids: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    wanted = {str(route_id).strip() for route_id in route_ids if str(route_id).strip()}
+    selected = [option for option in options if option["route_id"] in wanted]
+    if not selected:
+        raise ValueError("selected route ids were not found")
+
+    points: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for option in selected:
+        for point in option["points"]:
+            key = (str(point.get("stop", "")), round(float(point["tm_x"])), round(float(point["tm_y"])))
+            if key in seen:
+                continue
+            points.append(point)
+            seen.add(key)
+    return points, [f"{option['route_id']}({option['name']})" for option in selected]
 
 
 def fetch_accinfo(limit: int = 1000) -> list[dict[str, Any]]:
@@ -574,13 +935,26 @@ def fetch_accinfo(limit: int = 1000) -> list[dict[str, Any]]:
     return rows
 
 
-def distance_m(area: dict[str, Any], issue: dict[str, Any]) -> float | None:
+def point_distance_m(point: dict[str, Any], issue: dict[str, Any]) -> float | None:
     try:
-        dx = float(area["tm_x"]) - float(issue["grs80tm_x"])
-        dy = float(area["tm_y"]) - float(issue["grs80tm_y"])
+        dx = float(point["tm_x"]) - float(issue["grs80tm_x"])
+        dy = float(point["tm_y"]) - float(issue["grs80tm_y"])
     except (KeyError, TypeError, ValueError):
         return None
     return (dx * dx + dy * dy) ** 0.5
+
+
+def distance_m(area: dict[str, Any], issue: dict[str, Any]) -> float | None:
+    if area.get("area_type") == "admin_dong":
+        try:
+            return 0.0 if admin_dong_for_issue(issue).get("code") == area.get("region_code") else None
+        except (KeyError, TypeError, ValueError):
+            return None
+    points = area.get("points")
+    if isinstance(points, list) and points:
+        distances = [distance for point in points if (distance := point_distance_m(point, issue)) is not None]
+        return min(distances) if distances else None
+    return point_distance_m(area, issue)
 
 
 def traffic_issue_lines(areas: list[dict[str, Any]], issues: list[dict[str, Any]]) -> list[str]:
@@ -590,7 +964,10 @@ def traffic_issue_lines(areas: list[dict[str, Any]], issues: list[dict[str, Any]
             distance = distance_m(area, issue)
             if distance is not None and distance <= int(area["radius_m"]):
                 summary = issue.get("acc_info") or "교통 이슈"
-                lines.append(f"- {area['label']} {round(distance)}m: {summary}")
+                if area.get("area_type") == "admin_dong":
+                    lines.append(f"- {area['label']} 행정동: {summary}")
+                else:
+                    lines.append(f"- {area['label']} {round(distance)}m: {summary}")
     return lines[:5]
 
 
@@ -635,6 +1012,38 @@ def validate_schedule(args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> d
     except Exception:
         raise ValueError(f"Unknown timezone: {timezone}") from None
 
+    def date_value(name: str) -> str | None:
+        value = str(args.get(name, "")).strip()
+        if not value:
+            return None
+        datetime.fromisoformat(value)
+        return value
+
+    raw_skip_dates = args.get("skip_dates", [])
+    if raw_skip_dates is None:
+        raw_skip_dates = []
+    if not isinstance(raw_skip_dates, list):
+        raise ValueError("skip_dates must be a list")
+    skip_dates = []
+    for item in raw_skip_dates:
+        value = str(item).strip()
+        datetime.fromisoformat(value)
+        skip_dates.append(value)
+
+    interval_days = int(args.get("interval_days", 0) or 0)
+    if interval_days < 0 or interval_days > 365:
+        raise ValueError("interval_days must be between 1 and 365")
+    start_date = date_value("start_date")
+    end_date = date_value("end_date")
+    pause_start_date = date_value("pause_start_date")
+    pause_end_date = date_value("pause_end_date")
+    if interval_days and not start_date:
+        raise ValueError("start_date is required when interval_days is set")
+    if start_date and end_date and datetime.fromisoformat(end_date) < datetime.fromisoformat(start_date):
+        raise ValueError("end_date must be on or after start_date")
+    if pause_start_date and pause_end_date and datetime.fromisoformat(pause_end_date) < datetime.fromisoformat(pause_start_date):
+        raise ValueError("pause_end_date must be on or after pause_start_date")
+
     return {
         "label": label,
         "area_label": area_label,
@@ -645,7 +1054,42 @@ def validate_schedule(args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> d
         "send_policy": send_policy,
         "enabled": bool(args.get("enabled", True)),
         "last_sent_date": schedules.get(label, {}).get("last_sent_date"),
+        "skip_dates": skip_dates,
+        "pause_start_date": pause_start_date,
+        "pause_end_date": pause_end_date,
+        "start_date": start_date,
+        "end_date": end_date,
+        "interval_days": interval_days,
     }
+
+
+def schedule_due_on(schedule: dict[str, Any], local_now: datetime) -> bool:
+    today = local_now.date()
+    today_text = today.isoformat()
+    if schedule.get("last_sent_date") == today_text:
+        return False
+    if today_text in set(schedule.get("skip_dates") or []):
+        return False
+    if start := schedule.get("start_date"):
+        if today < datetime.fromisoformat(start).date():
+            return False
+    if end := schedule.get("end_date"):
+        if today > datetime.fromisoformat(end).date():
+            return False
+    if pause_start := schedule.get("pause_start_date"):
+        pause_end = schedule.get("pause_end_date") or pause_start
+        if datetime.fromisoformat(pause_start).date() <= today <= datetime.fromisoformat(pause_end).date():
+            return False
+    if WEEKDAYS[local_now.weekday()] not in schedule["weekdays"]:
+        return False
+    if local_now.strftime("%H:%M") != schedule["time"]:
+        return False
+    interval_days = int(schedule.get("interval_days") or 0)
+    if interval_days:
+        anchor_text = schedule.get("start_date") or today_text
+        if (today - datetime.fromisoformat(anchor_text).date()).days % interval_days:
+            return False
+    return True
 
 
 def run_due_alerts(now: datetime | None = None) -> list[str]:
@@ -660,11 +1104,7 @@ def run_due_alerts(now: datetime | None = None) -> list[str]:
                     continue
                 local_now = now.astimezone(ZoneInfo(schedule.get("timezone", "Asia/Seoul")))
                 today = local_now.date().isoformat()
-                if schedule.get("last_sent_date") == today:
-                    continue
-                if WEEKDAYS[local_now.weekday()] not in schedule["weekdays"]:
-                    continue
-                if local_now.strftime("%H:%M") != schedule["time"]:
+                if not schedule_due_on(schedule, local_now):
                     continue
 
                 area = areas.get(schedule["area_label"])
@@ -710,31 +1150,159 @@ def server_address() -> tuple[str, int]:
 
 def call_tool(name: str, args: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
     areas = user_alert_areas(user_id)
+    transit_options = user_transit_route_options(user_id)
     schedules = user_scheduled_alerts(user_id)
 
     if name == "set_alert_area":
         label = str(args["label"]).strip()
         address = str(args["address"]).strip()
-        radius_m = int(args.get("radius_m", 1000))
+        radius_m = validate_radius(args.get("radius_m"), 1000)
         if not label or not address:
             raise ValueError("label and address are required")
-        if radius_m < 100 or radius_m > 5000:
-            raise ValueError("radius_m must be between 100 and 5000")
         try:
             geo = geocode_address(address)
         except urllib.error.URLError:
             return text_result("주소 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
         except ValueError:
             return text_result("장소나 주소를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
-        areas[label] = {"label": label, "address": address, "radius_m": radius_m, **geo}
+        areas[label] = {"label": label, "area_type": "point_circle", "address": address, "radius_m": radius_m, **geo}
         save_alert_area(areas[label], user_id)
         return text_result(f"Registered alert area '{label}' at {geo['address_name']} with radius {radius_m}m.")
+
+    if name == "set_route_alert_area":
+        label = str(args["label"]).strip()
+        origin_text = str(args["origin"]).strip()
+        destination_text = str(args["destination"]).strip()
+        radius_m = validate_radius(args.get("radius_m"), 700)
+        if not label or not origin_text or not destination_text:
+            raise ValueError("label, origin, and destination are required")
+        try:
+            origin = geocode_address(origin_text)
+            destination = geocode_address(destination_text)
+            points = route_points(origin, destination)
+        except urllib.error.URLError:
+            return text_result("경로 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+        except ValueError:
+            return text_result("출발지나 도착지를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
+        area = {
+            "label": label,
+            "area_type": "route_corridor",
+            "address": f"{origin_text} -> {destination_text}",
+            "address_name": f"{origin['address_name']} -> {destination['address_name']}",
+            "radius_m": radius_m,
+            "tm_x": points[0]["tm_x"],
+            "tm_y": points[0]["tm_y"],
+            "points": points,
+        }
+        areas[label] = area
+        save_alert_area(area, user_id)
+        return text_result(f"Registered route alert area '{label}' from {origin_text} to {destination_text} with corridor radius {radius_m}m.")
+
+    if name == "set_transit_route_alert_area":
+        label = str(args["label"]).strip()
+        stops = args.get("stops")
+        radius_m = validate_radius(args.get("radius_m"), 500)
+        if not label or not isinstance(stops, list) or not stops:
+            raise ValueError("label and stops are required")
+        try:
+            points = transit_points([str(stop) for stop in stops])
+        except urllib.error.URLError:
+            return text_result("대중교통 경유지 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+        except ValueError:
+            return text_result("경유 역이나 정류장을 찾을 수 없습니다. 더 구체적으로 입력해 주세요.")
+        area = {
+            "label": label,
+            "area_type": "transit_stops",
+            "address": " -> ".join(point["stop"] for point in points),
+            "address_name": " -> ".join(point["stop"] for point in points),
+            "radius_m": radius_m,
+            "tm_x": points[0]["tm_x"],
+            "tm_y": points[0]["tm_y"],
+            "points": points,
+        }
+        areas[label] = area
+        save_alert_area(area, user_id)
+        return text_result(f"Registered transit alert area '{label}' for stops: {area['address_name']} with radius {radius_m}m.")
+
+    if name == "find_transit_route_options":
+        label = str(args["label"]).strip()
+        if not label:
+            raise ValueError("label is required")
+        try:
+            options = build_transit_route_options(args)
+        except urllib.error.URLError:
+            return text_result("대중교통 후보 경로 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+        except ValueError:
+            return text_result("대중교통 후보 경로를 만들 수 없습니다. 출발지, 도착지, 경유 후보를 더 구체적으로 입력해 주세요.")
+        transit_options[label] = options
+        return text_result(transit_route_options_text(options))
+
+    if name == "set_selected_transit_route_alert_area":
+        label = str(args["label"]).strip()
+        route_ids = args.get("route_ids")
+        radius_m = validate_radius(args.get("radius_m"), 500)
+        if not label or not isinstance(route_ids, list) or not route_ids:
+            raise ValueError("label and route_ids are required")
+        options = transit_options.get(label)
+        if not options:
+            return text_result("먼저 find_transit_route_options로 후보 경로를 조회해 주세요.")
+        try:
+            points, selected_names = selected_transit_points(options, route_ids)
+        except ValueError:
+            return text_result("선택한 route_id를 찾을 수 없습니다. 후보 목록의 route_id를 그대로 선택해 주세요.")
+        area = {
+            "label": label,
+            "area_type": "transit_selected_routes",
+            "address": ", ".join(selected_names),
+            "address_name": ", ".join(selected_names),
+            "radius_m": radius_m,
+            "tm_x": points[0]["tm_x"],
+            "tm_y": points[0]["tm_y"],
+            "points": points,
+        }
+        areas[label] = area
+        save_alert_area(area, user_id)
+        return text_result(f"Registered selected transit route area '{label}' for {', '.join(selected_names)} with radius {radius_m}m.")
+
+    if name == "set_district_alert_area":
+        label = str(args["label"]).strip()
+        district = str(args["district"]).strip()
+        if not label or not district:
+            raise ValueError("label and district are required")
+        try:
+            geo = admin_dong_for_text(district)
+        except urllib.error.URLError:
+            return text_result("행정동 조회를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+        except ValueError:
+            return text_result("행정동을 찾을 수 없습니다. 구 이름과 함께 더 구체적으로 입력해 주세요.")
+        area = {"label": label, "area_type": "admin_dong", "address": district, "radius_m": 0, **geo}
+        areas[label] = area
+        save_alert_area(area, user_id)
+        return text_result(f"Registered administrative dong alert area '{label}' for {geo['address_name']}.")
+
+    if name == "set_alert_areas":
+        items = args.get("areas")
+        if not isinstance(items, list) or not items:
+            raise ValueError("areas must be a non-empty list")
+        registered: list[str] = []
+        for item in items[:10]:
+            label = str(item["label"]).strip()
+            address = str(item["address"]).strip()
+            radius_m = validate_radius(item.get("radius_m"), 1000)
+            if not label or not address:
+                raise ValueError("each area requires label and address")
+            geo = geocode_address(address)
+            area = {"label": label, "area_type": "point_circle", "address": address, "radius_m": radius_m, **geo}
+            areas[label] = area
+            save_alert_area(area, user_id)
+            registered.append(f"{label}({geo['address_name']}, {radius_m}m)")
+        return text_result("Registered alert areas: " + ", ".join(registered))
 
     if name == "list_alert_areas":
         if not areas:
             return text_result("No alert areas registered.")
         lines = [
-            f"- {area['label']}: {area.get('address_name') or area['address']} ({area['radius_m']}m)"
+            f"- {area['label']}: {area.get('address_name') or area['address']} ({area.get('area_type', 'point_circle')}, {area['radius_m']}m)"
             for area in areas.values()
         ]
         return text_result("\n".join(lines))

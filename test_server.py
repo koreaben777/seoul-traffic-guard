@@ -19,6 +19,8 @@ from server import (
     OAUTH_TOKENS,
     SCHEDULED_ALERTS,
     TOOLS,
+    TRANSIT_ROUTE_OPTIONS,
+    admin_dong_for_text,
     build_kakao_authorize_url,
     complete_oauth,
     geocode_address,
@@ -55,6 +57,12 @@ def test_tool_contract():
     assert names == [
         "set_alert_area",
         "list_alert_areas",
+        "set_route_alert_area",
+        "set_transit_route_alert_area",
+        "find_transit_route_options",
+        "set_selected_transit_route_alert_area",
+        "set_district_alert_area",
+        "set_alert_areas",
         "check_traffic_issues",
         "preview_alert_message",
         "send_self_alert",
@@ -249,7 +257,7 @@ def test_rpc_flow():
     assert initialized["serverInfo"]["name"] == "seoul-traffic-guard"
 
     listed = rpc("tools/list")["result"]["tools"]
-    assert len(listed) == 8
+    assert len(listed) == 14
 
     with patch(
         "server.geocode_address",
@@ -358,6 +366,191 @@ def test_geocode_address_accepts_place_keyword():
 
     assert result["address_name"] == "서울 중구 을지로 42"
     assert result["tm_x"] == 198100.0
+
+
+def test_set_route_alert_area_matches_issue_near_route_point():
+    ALERT_AREAS.clear()
+    geocodes = {
+        "집": {"address_name": "집", "x": 126.9, "y": 37.5, "tm_x": 198000.0, "tm_y": 451000.0},
+        "학교": {"address_name": "학교", "x": 127.0, "y": 37.6, "tm_x": 199000.0, "tm_y": 452000.0},
+    }
+
+    with patch("server.geocode_address", side_effect=lambda value: geocodes[value]), patch(
+        "server.route_points",
+        return_value=[{"tm_x": 198000.0, "tm_y": 451000.0}, {"tm_x": 199000.0, "tm_y": 452000.0}],
+    ):
+        rpc(
+            "tools/call",
+            {
+                "name": "set_route_alert_area",
+                "arguments": {"label": "등교길", "origin": "집", "destination": "학교", "radius_m": 700},
+            },
+        )
+
+    assert areas()["등교길"]["area_type"] == "route_corridor"
+    with patch(
+        "server.fetch_accinfo",
+        return_value=[{"grs80tm_x": 199100.0, "grs80tm_y": 452100.0, "acc_info": "공사"}],
+    ):
+        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "등교길"}})["result"]["content"][0]["text"]
+    assert "공사" in text
+
+
+def test_set_district_alert_area_registers_area():
+    ALERT_AREAS.clear()
+    with patch(
+        "server.admin_dong_for_text",
+        return_value={
+            "address_name": "서울특별시 강남구 역삼1동",
+            "region_code": "1168064000",
+            "region_1depth_name": "서울특별시",
+            "region_2depth_name": "강남구",
+            "region_3depth_name": "역삼1동",
+            "x": 127.033,
+            "y": 37.5,
+            "tm_x": 202000.0,
+            "tm_y": 445000.0,
+        },
+    ):
+        rpc(
+            "tools/call",
+            {"name": "set_district_alert_area", "arguments": {"label": "회사동네", "district": "역삼1동"}},
+        )
+
+    assert areas()["회사동네"]["area_type"] == "admin_dong"
+    assert areas()["회사동네"]["region_code"] == "1168064000"
+    with patch("server.fetch_accinfo", return_value=[{"grs80tm_x": 202100.0, "grs80tm_y": 445100.0, "acc_info": "통제"}]), patch(
+        "server.admin_dong_for_issue",
+        return_value={"code": "1168064000"},
+    ):
+        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "회사동네"}})["result"]["content"][0]["text"]
+    assert "통제" in text
+
+
+def test_admin_dong_for_text_uses_region_code():
+    with patch(
+        "server.geocode_address",
+        return_value={"address_name": "역삼1동 주민센터", "x": 127.033, "y": 37.5, "tm_x": 202000.0, "tm_y": 445000.0},
+    ), patch(
+        "server.region_for_coords",
+        return_value={
+            "address_name": "서울특별시 강남구 역삼1동",
+            "code": "1168064000",
+            "region_1depth_name": "서울특별시",
+            "region_2depth_name": "강남구",
+            "region_3depth_name": "역삼1동",
+        },
+    ):
+        result = admin_dong_for_text("역삼1동")
+
+    assert result["address_name"] == "서울특별시 강남구 역삼1동"
+    assert result["region_code"] == "1168064000"
+
+
+def test_set_transit_route_alert_area_matches_station_issue():
+    ALERT_AREAS.clear()
+
+    def fake_geocode(stop):
+        return {
+            "address_name": stop,
+            "x": 126.973,
+            "y": 37.522,
+            "tm_x": 197000.0,
+            "tm_y": 449000.0,
+        }
+
+    with patch("server.geocode_address", side_effect=fake_geocode):
+        rpc(
+            "tools/call",
+            {"name": "set_transit_route_alert_area", "arguments": {"label": "지하철출근길", "stops": ["이촌역"]}},
+        )
+
+    assert areas()["지하철출근길"]["area_type"] == "transit_stops"
+    with patch("server.fetch_accinfo", return_value=[{"grs80tm_x": 197100.0, "grs80tm_y": 449100.0, "acc_info": "이촌역 사고"}]):
+        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "지하철출근길"}})["result"]["content"][0]["text"]
+    assert "이촌역 사고" in text
+
+
+def test_selectable_transit_route_options_register_chosen_route_only():
+    ALERT_AREAS.clear()
+    TRANSIT_ROUTE_OPTIONS.clear()
+    coords = {
+        "출발지": (1000.0, 1000.0),
+        "이촌역": (2000.0, 2000.0),
+        "도착지": (3000.0, 3000.0),
+        "공덕역": (9000.0, 9000.0),
+    }
+
+    def fake_geocode(stop):
+        tm_x, tm_y = coords[stop]
+        return {"address_name": stop, "x": 126.0, "y": 37.0, "tm_x": tm_x, "tm_y": tm_y}
+
+    with patch("server.geocode_address", side_effect=fake_geocode):
+        text = rpc(
+            "tools/call",
+            {
+                "name": "find_transit_route_options",
+                "arguments": {
+                    "label": "선택출근길",
+                    "origin": "출발지",
+                    "destination": "도착지",
+                    "route_options": [
+                        {"name": "이촌 경유", "stops": ["출발지", "이촌역", "도착지"]},
+                        {"name": "공덕 경유", "stops": ["출발지", "공덕역", "도착지"]},
+                    ],
+                },
+            },
+        )["result"]["content"][0]["text"]
+
+    assert "[ ] route-1 - 이촌 경유" in text
+    assert "[ ] route-2 - 공덕 경유" in text
+
+    result = rpc(
+        "tools/call",
+        {"name": "set_selected_transit_route_alert_area", "arguments": {"label": "선택출근길", "route_ids": ["route-1"], "radius_m": 200}},
+    )["result"]["content"][0]["text"]
+    assert "route-1(이촌 경유)" in result
+    area = areas()["선택출근길"]
+    assert area["area_type"] == "transit_selected_routes"
+    assert [point["stop"] for point in area["points"]] == ["출발지", "이촌역", "도착지"]
+
+    issues = [
+        {"grs80tm_x": 2050.0, "grs80tm_y": 2050.0, "acc_info": "이촌역 사고"},
+        {"grs80tm_x": 9000.0, "grs80tm_y": 9000.0, "acc_info": "공덕역 통제"},
+    ]
+    with patch("server.fetch_accinfo", return_value=issues):
+        text = rpc("tools/call", {"name": "check_traffic_issues", "arguments": {"label": "선택출근길"}})["result"]["content"][0]["text"]
+    assert "이촌역 사고" in text
+    assert "공덕역 통제" not in text
+
+
+def test_set_alert_areas_registers_multiple_places():
+    ALERT_AREAS.clear()
+
+    def fake_geocode(address):
+        return {
+            "address_name": address,
+            "x": 126.978,
+            "y": 37.566,
+            "tm_x": 198000.0,
+            "tm_y": 451000.0,
+        }
+
+    with patch("server.geocode_address", side_effect=fake_geocode):
+        rpc(
+            "tools/call",
+            {
+                "name": "set_alert_areas",
+                "arguments": {
+                    "areas": [
+                        {"label": "집", "address": "서울역", "radius_m": 1000},
+                        {"label": "회사", "address": "서울시청", "radius_m": 500},
+                    ]
+                },
+            },
+        )
+
+    assert set(areas()) == {"집", "회사"}
 
 
 def test_check_traffic_issues_filters_accinfo_near_area():
@@ -550,6 +743,64 @@ def test_run_due_alerts_continues_after_one_schedule_fails():
     assert schedules()["good_morning"]["last_sent_date"] == "2026-06-19"
 
 
+def test_run_due_alerts_respects_holiday_pause_and_interval_rules():
+    ALERT_AREAS.clear()
+    SCHEDULED_ALERTS.clear()
+    areas()["commute"] = {"label": "commute", "address": "x", "radius_m": 100, "tm_x": 198000.0, "tm_y": 451000.0}
+    base = {
+        "area_label": "commute",
+        "weekdays": ["mon"],
+        "time": "07:00",
+        "timezone": "Asia/Seoul",
+        "target_day": "today",
+        "send_policy": "always",
+        "enabled": True,
+        "last_sent_date": None,
+    }
+    schedules()["holiday"] = {**base, "label": "holiday", "skip_dates": ["2026-06-22"]}
+    schedules()["paused"] = {**base, "label": "paused", "pause_start_date": "2026-06-20", "pause_end_date": "2026-06-23"}
+    schedules()["interval"] = {**base, "label": "interval", "start_date": "2026-06-21", "interval_days": 2}
+
+    delivered = []
+    with (
+        patch("server.fetch_accinfo", return_value=[]),
+        patch("server.send_kakao_self_message", side_effect=lambda message, user_id="local": delivered.append(message)),
+    ):
+        sent = run_due_alerts(datetime(2026, 6, 22, 7, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+
+    assert sent == []
+    assert delivered == []
+
+
+def test_run_due_alerts_runs_matching_interval_rule():
+    ALERT_AREAS.clear()
+    SCHEDULED_ALERTS.clear()
+    areas()["commute"] = {"label": "commute", "address": "x", "radius_m": 100, "tm_x": 198000.0, "tm_y": 451000.0}
+    schedules()["interval"] = {
+        "label": "interval",
+        "area_label": "commute",
+        "weekdays": ["tue"],
+        "time": "07:00",
+        "timezone": "Asia/Seoul",
+        "target_day": "today",
+        "send_policy": "always",
+        "enabled": True,
+        "last_sent_date": None,
+        "start_date": "2026-06-21",
+        "interval_days": 2,
+    }
+
+    delivered = []
+    with (
+        patch("server.fetch_accinfo", return_value=[]),
+        patch("server.send_kakao_self_message", side_effect=lambda message, user_id="local": delivered.append(message)),
+    ):
+        sent = run_due_alerts(datetime(2026, 6, 23, 7, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+
+    assert len(sent) == 1
+    assert delivered == sent
+
+
 def test_kakao_authorize_url_requests_talk_message_scope():
     url = build_kakao_authorize_url("state-123")
 
@@ -736,12 +987,21 @@ if __name__ == "__main__":
     test_rpc_flow()
     test_rpc_user_data_isolated()
     test_set_alert_area_stores_geocoded_coordinates()
+    test_geocode_address_accepts_place_keyword()
+    test_set_route_alert_area_matches_issue_near_route_point()
+    test_set_district_alert_area_registers_area()
+    test_admin_dong_for_text_uses_region_code()
+    test_set_transit_route_alert_area_matches_station_issue()
+    test_selectable_transit_route_options_register_chosen_route_only()
+    test_set_alert_areas_registers_multiple_places()
     test_check_traffic_issues_filters_accinfo_near_area()
     test_check_traffic_issues_returns_short_external_error()
     test_fetch_accinfo_normalizes_uppercase_xml_tags()
     test_schedule_tools_register_list_delete()
     test_run_due_alerts_sends_once_per_day_when_issues_match()
     test_run_due_alerts_continues_after_one_schedule_fails()
+    test_run_due_alerts_respects_holiday_pause_and_interval_rules()
+    test_run_due_alerts_runs_matching_interval_rule()
     test_kakao_authorize_url_requests_talk_message_scope()
     test_complete_oauth_stores_tokens()
     test_complete_oauth_stores_tokens_per_user()
